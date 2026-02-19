@@ -38,5 +38,6 @@ TAG="Test" sh -c "$(curl -fsSL https://raw.githubusercontent.com/lengyuic/shell_
 
 ### II. 开启白名单
 ```
-RELAY_IP="ip1,ip2,ip3" sh -c "$(curl -fsSL https://raw.githubusercontent.com/lengyuic/shell_scripts/refs/heads/main/firewall_setup.sh)"
+admin|user
+RELAY_IP="ip1|ip2,ip3" sh -c "$(curl -fsSL https://raw.githubusercontent.com/lengyuic/shell_scripts/refs/heads/main/firewall_setup.sh)"
 ```
