@@ -24,7 +24,7 @@ echo "set mouse=" > ~/.vimrc
 curl -fsSL https://raw.githubusercontent.com/lengyuic/shell_scripts/refs/heads/main/fail2ban_setup.sh | sh
 ```
 
-# 6. singbox 脚本配置
+# 6. singbox 脚本配置(二选一 执行)
 ## ① 优化机器(中转机) 配置
 ```
 TAG="Test" sh -c "$(curl -fsSL https://raw.githubusercontent.com/lengyuic/shell_scripts/refs/heads/main/singbox_setup_proxy.sh)"
