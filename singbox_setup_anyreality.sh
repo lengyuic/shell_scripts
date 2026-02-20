@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # Debian/Ubuntu Sing-Box 自动配置脚本
-# 功能: 自动配置 AnyTLS + Reality，输出 JSON 配置
+# 功能: 自动配置 AnyTLS + Reality，输出 JSON 客户端配置
 # 运行方式: curl -fsSL url | sh
 
 set -e
@@ -41,7 +41,7 @@ check_install_deps() {
 
     if ! command -v sing-box >/dev/null 2>&1; then
         log_warn "未检测到 Sing-Box，开始自动安装..."
-        curl -fsSL https://sing-box.app/install.sh | sh
+        curl -fsSL https://sing-box.app/deb-install.sh | bash
         if ! command -v sing-box >/dev/null 2>&1; then
             log_error "Sing-Box 安装失败"
             exit 1
@@ -55,22 +55,31 @@ get_best_domain() {
     DOMAINS="www.microsoft.com www.apple.com www.amazon.com www.nvidia.com www.amd.com www.intel.com www.google.com www.bing.com www.icloud.com itunes.apple.com s0.awsstatic.com www.oracle.com www.cisco.com www.samsung.com www.ibm.com www.adobe.com www.dell.com www.tesla.com www.qualcomm.com azure.microsoft.com"
     
     BEST_DOMAIN=""
-    MIN_TIME=10.0
+    MIN_TIME="10.000"
 
     for d in $DOMAINS; do
-        time_cost=$(curl -o /dev/null -s -w '%{time_total}' --connect-timeout 1 "https://$d" || echo "10.0")
-        is_faster=$(awk "BEGIN {print ($time_cost < $MIN_TIME)}")
+        # 获取延迟，清洗非数字字符，失败回退 10.000
+        raw_time=$(curl -o /dev/null -s -w '%{time_total}' --connect-timeout 1 "https://$d" 2>/dev/null || true)
+        time_cost=$(printf '%s' "$raw_time" | tr -dc '0-9.')
+        
+        # 验证是否为合法浮点数，不合法则跳过
+        case "$time_cost" in
+            [0-9]*.[0-9]*) ;;
+            *) time_cost="10.000" ;;
+        esac
+
+        is_faster=$(awk -v t="$time_cost" -v m="$MIN_TIME" 'BEGIN {print (t+0 < m+0) ? 1 : 0}')
         
         if [ "$is_faster" -eq 1 ]; then
             MIN_TIME=$time_cost
             BEST_DOMAIN=$d
-            printf "   - %-20s : ${GREEN}%.3fs${NC}\n" "$d" "$time_cost"
+            printf "   - %-25s : ${GREEN}%ss${NC}\n" "$d" "$time_cost"
         else
-            printf "   - %-20s : %.3fs\n" "$d" "$time_cost"
+            printf "   - %-25s : %ss\n" "$d" "$time_cost"
         fi
     done
 
-    if [ -z "$BEST_DOMAIN" ] || [ "$MIN_TIME" = "10.0" ]; then
+    if [ -z "$BEST_DOMAIN" ] || [ "$MIN_TIME" = "10.000" ]; then
         BEST_DOMAIN="www.microsoft.com"
         log_warn "所有域名测试超时，回退默认: $BEST_DOMAIN"
     else
@@ -98,7 +107,6 @@ get_server_ip() {
 generate_config() {
     log_info "生成密钥对和密码..."
     
-    # 生成 16 字节随机密码并 Base64 编码
     PASSWORD=$(openssl rand -base64 16)
     
     pair_out=$(sing-box generate reality-keypair)
@@ -129,6 +137,17 @@ generate_config() {
           "password": "${PASSWORD}"
         }
       ],
+      "padding_scheme": [
+        "stop=8",
+        "0=40-80",
+        "1=120-300",
+        "2=300-600,c,500-1000,c,800-1200",
+        "3=150-400,c,1000-1400",
+        "4=1000-1400",
+        "5=1000-1400",
+        "6=1000-1400",
+        "7=1000-1400"
+      ],
       "tls": {
         "enabled": true,
         "server_name": "${BEST_DOMAIN}",
@@ -151,7 +170,10 @@ generate_config() {
       "type": "direct",
       "tag": "direct"
     }
-  ]
+  ],
+  "route": {
+    "final": "direct"
+  }
 }
 EOF
 }
@@ -186,13 +208,13 @@ print_client_config() {
         SERVER_IP="[无法获取IP]"
         log_warn "公网 IP 获取失败"
     fi
-    
+
     printf "\n"
     printf "${BLUE}========================================================${NC}\n"
     printf "📋 节点信息 (Tag: ${NODE_TAG})\n"
     printf "${BLUE}========================================================${NC}\n"
 
-    printf "${CYAN}📄 JSON 配置片段 (复制到客户端 outbounds):${NC}\n"
+    printf "${CYAN}📄 客户端 JSON 配置片段:${NC}\n"
     cat <<EOF
 {
     "tag": "${NODE_TAG}",
@@ -222,7 +244,7 @@ EOF
 
 # --- 主流程 ---
 main() {
-    printf "${BLUE}🚀 Sing-Box AnyTLS + Reality 自动配置脚本 (Tag: ${NODE_TAG})${NC}\n"
+    printf "${BLUE}🚀 Sing-Box AnyTLS 自动配置脚本 (Tag: ${NODE_TAG})${NC}\n"
     check_install_deps
     get_best_domain
     generate_config
