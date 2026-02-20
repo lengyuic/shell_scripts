@@ -27,8 +27,14 @@ curl -fsSL https://raw.githubusercontent.com/lengyuic/shell_scripts/refs/heads/m
 
 # 6. singbox 脚本配置(二选一 执行)
 ## ① 优化机器(中转机) 配置
+### I. vless+reality
 ```
 TAG="Test" sh -c "$(curl -fsSL https://raw.githubusercontent.com/lengyuic/shell_scripts/refs/heads/main/singbox_setup_proxy.sh)"
+```
+
+### II. anyreality
+```
+TAG="Test" sh -c "$(curl -fsSL https://raw.githubusercontent.com/lengyuic/shell_scripts/refs/heads/main/singbox_setup_anyreality.sh)"
 ```
 
 ## ② 落地机 配置
