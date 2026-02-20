@@ -52,7 +52,7 @@ check_install_deps() {
 # 3. 筛选低延迟域名
 get_best_domain() {
     log_info "正在筛选低延迟 Reality 目标域名..."
-    DOMAINS="c.6sc.co a.b.cdn.console.awsstatic.com assets.adobedtm.com ds-aksb-a.akamaihd.net vscjava.gallerycdn.vsassets.io prod.pa.cdn.uis.awsstatic.com s7mbrstream.scene7.com s0.awsstatic.com mscom.demdex.net a0.awsstatic.com amd.com aws.com www.icloud.com www.apple.com www.oracle.com cdn.bizibly.com www.xilinx.com drivers.amd.com apps.apple.com r.bing.com ocsp2.apple.com cdn.userway.org download.amd.com intel.com b.6sc.co d1.awsstatic.com d.oracleinfinity.io prod.log.shortbread.aws.dev amp-api-edge.apps.apple.com lpcdn.lpsnmedia.net www.nvidia.com c.marsflag.com ipv6.6sc.co"
+    DOMAINS="www.microsoft.com www.apple.com www.amazon.com www.nvidia.com www.amd.com www.intel.com www.google.com www.bing.com www.icloud.com itunes.apple.com s0.awsstatic.com www.oracle.com www.cisco.com www.samsung.com www.ibm.com www.adobe.com www.dell.com www.tesla.com www.qualcomm.com azure.microsoft.com"
     
     BEST_DOMAIN=""
     MIN_TIME=10.0
