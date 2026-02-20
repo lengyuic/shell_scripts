@@ -11,7 +11,7 @@ apt install vim git curl tar wget zsh -y
 
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
 
-sed 's/ZSH_THEME="robbyrussell"/ZSH_THEME="ys"/' ~/.zshrc
+sed -i 's/ZSH_THEME="robbyrussell"/ZSH_THEME="ys"/' ~/.zshrc
 source ~/.zshrc
 
 usermod -s /bin/zsh root
@@ -22,9 +22,20 @@ usermod -s /bin/zsh root
 echo "set mouse=" > ~/.vimrc
 ```
 
-# 4. 禁用ssh密钥登录
+# 4. 启用Fail2Ban
 ```
 curl -fsSL https://raw.githubusercontent.com/lengyuic/shell_scripts/refs/heads/main/fail2ban_setup.sh | sh
+```
+
+# 5. 修改ssh关闭密码
+```
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%F)
+sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/g' /etc/ssh/sshd_config
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/g' /etc/ssh/sshd_config
+sed -i 's/^#\?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/g' /etc/ssh/sshd_config
+sed -i 's/^#\?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/g' /etc/ssh/sshd_config
+sshd -t
+systemctl restart sshd
 ```
 
 # 6. singbox 脚本配置(二选一 执行)
