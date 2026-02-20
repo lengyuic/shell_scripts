@@ -41,7 +41,7 @@ check_install_deps() {
 
     if ! command -v sing-box >/dev/null 2>&1; then
         log_warn "未检测到 Sing-Box，开始自动安装..."
-        curl -fsSL https://sing-box.app/deb-install.sh | bash
+        curl -fsSL https://sing-box.app/install.sh | sh
         if ! command -v sing-box >/dev/null 2>&1; then
             log_error "Sing-Box 安装失败"
             exit 1
