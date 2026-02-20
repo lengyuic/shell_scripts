@@ -11,6 +11,7 @@ apt install vim git curl tar wget zsh -y
 
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
 
+sed 's/ZSH_THEME="robbyrussell"/ZSH_THEME="ys"/' ~/.zshrc
 source ~/.zshrc
 ```
 
