@@ -1,16 +1,41 @@
 #!/bin/sh
 
 # Debian/Ubuntu Sing-Box Shadowsocks 2022 自动配置脚本
-# 功能: 自动配置 SS-2022，输出标准 SIP002 链接和精简 JSON
-# 运行方式: curl -fsSL url | sh
+# 功能: 自动配置 SS-2022，支持环境变量注入，无交互全自动
+#
+# 1. 自定义安装: PORT=8443 TAG="HK_Node" sh -c "$(curl -fsSL url)"
+# 2. 随机安装:   sh -c "$(curl -fsSL url)"
 
 set -e
 
-# --- 变量与默认值 ---
-NODE_TAG="${TAG:-MySSNode}"
+# --- 变量处理逻辑 (核心修改) ---
+
+# 1. 处理 TAG (优先读取环境变量，否则使用默认)
+if [ -n "$TAG" ]; then
+    NODE_TAG="$TAG"
+    TAG_SOURCE="环境变量"
+else
+    NODE_TAG="MySSNode"
+    TAG_SOURCE="默认值"
+fi
+
+# 2. 处理 PORT (优先读取环境变量，否则随机生成)
+if [ -n "$PORT" ]; then
+    # 简单检查是否为数字
+    case $PORT in
+        ''|*[!0-9]*) 
+            echo "错误: 提供的 PORT 不是数字"
+            exit 1 ;;
+        *) ;;
+    esac
+    LISTEN_PORT="$PORT"
+    PORT_SOURCE="环境变量"
+else
+    LISTEN_PORT=$(shuf -i 10000-60000 -n 1)
+    PORT_SOURCE="自动随机"
+fi
+
 CONFIG_FILE="/etc/sing-box/config.json"
-# 随机生成端口 (10000-60000)
-PORT=$(shuf -i 10000-60000 -n 1)
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -33,8 +58,11 @@ fi
 
 # 2. 环境检查与安装
 check_install_deps() {
-    log_info "检查依赖环境..."
+    log_info "配置参数确认:"
+    printf "   - TAG  : ${CYAN}${NODE_TAG}${NC} [${TAG_SOURCE}]\n"
+    printf "   - PORT : ${CYAN}${LISTEN_PORT}${NC} [${PORT_SOURCE}]\n"
     
+    log_info "检查依赖环境..."
     if ! command -v curl >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
         apt-get update -qq >/dev/null
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl openssl ca-certificates >/dev/null
@@ -70,7 +98,6 @@ get_server_ip() {
 generate_config() {
     log_info "生成 SS-2022 密钥..."
     
-    # 生成 32 字节随机数据并进行 Base64 编码，作为 SS-2022 的密钥
     PASSWORD=$(openssl rand -base64 32)
     METHOD="2022-blake3-aes-256-gcm"
 
@@ -78,7 +105,7 @@ generate_config() {
         cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.$(date +%s)"
     fi
 
-    log_info "写入配置文件 (端口: $PORT)..."
+    log_info "写入配置文件..."
     cat > "$CONFIG_FILE" <<EOF
 {
   "log": {
@@ -91,7 +118,7 @@ generate_config() {
       "type": "shadowsocks",
       "tag": "ss-in",
       "listen": "::",
-      "listen_port": ${PORT},
+      "listen_port": ${LISTEN_PORT},
       "sniff": true,
       "sniff_override_destination": true,
       "method": "${METHOD}",
@@ -146,15 +173,13 @@ print_client_config() {
     SERVER_IP=$(get_server_ip)
     if [ -z "$SERVER_IP" ]; then SERVER_IP="YOUR_IP"; fi
 
-    # URL 编码 Tag (处理空格)
+    # URL 编码 Tag
     TAG_ENCODED=$(echo "$NODE_TAG" | sed 's/ /%20/g')
     
-    # --- 关键点：构造 SS 链接 ---
     RAW_USER_INFO="${METHOD}:${PASSWORD}"
     BASE64_USER_INFO=$(echo -n "${RAW_USER_INFO}" | base64 -w 0)
     
-    # 最终链接格式: ss://Base64(method:password)@ip:port#tag
-    SS_LINK="ss://${BASE64_USER_INFO}@${SERVER_IP}:${PORT}#${TAG_ENCODED}"
+    SS_LINK="ss://${BASE64_USER_INFO}@${SERVER_IP}:${LISTEN_PORT}#${TAG_ENCODED}"
     
     printf "\n"
     printf "${BLUE}========================================================${NC}\n"
@@ -165,13 +190,12 @@ print_client_config() {
     printf "%s\n\n" "$SS_LINK"
 
     printf "${CYAN}📄 JSON 客户端配置 (Sing-Box 格式):${NC}\n"
-    # 严格按照你要求的格式输出
     cat <<EOF
 {
     "tag": "${NODE_TAG}",
     "type": "shadowsocks",
     "server": "${SERVER_IP}",
-    "server_port": ${PORT},
+    "server_port": ${LISTEN_PORT},
     "method": "${METHOD}",
     "password": "${PASSWORD}"
 }
