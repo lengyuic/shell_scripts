@@ -13,6 +13,8 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/too
 
 sed 's/ZSH_THEME="robbyrussell"/ZSH_THEME="ys"/' ~/.zshrc
 source ~/.zshrc
+
+usermod -s /bin/zsh root
 ```
 
 # 3. vim 修改鼠标
