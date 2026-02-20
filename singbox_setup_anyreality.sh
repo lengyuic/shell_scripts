@@ -52,7 +52,7 @@ check_install_deps() {
 # 3. 筛选低延迟域名
 get_best_domain() {
     log_info "正在筛选低延迟 Reality 目标域名..."
-    DOMAINS="www.microsoft.com www.apple.com www.amazon.com www.nvidia.com www.amd.com www.intel.com www.google.com www.bing.com www.icloud.com itunes.apple.com s0.awsstatic.com www.oracle.com www.cisco.com www.samsung.com www.ibm.com www.adobe.com www.dell.com www.tesla.com www.qualcomm.com azure.microsoft.com"
+    DOMAINS="www.microsoft.com www.apple.com www.amazon.com www.nvidia.com www.amd.com www.intel.com www.google.com www.bing.com s0.awsstatic.com www.oracle.com www.cisco.com www.samsung.com www.ibm.com www.adobe.com www.dell.com www.tesla.com www.qualcomm.com azure.microsoft.com"
     
     BEST_DOMAIN=""
     MIN_TIME="10.000"
