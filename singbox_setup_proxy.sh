@@ -41,7 +41,7 @@ check_install_deps() {
 
     if ! command -v sing-box >/dev/null 2>&1; then
         log_warn "未检测到 Sing-Box，开始自动安装..."
-        curl -fsSL https://sing-box.app/deb-install.sh | bash
+        curl -fsSL https://sing-box.app/install.sh | sh
         if ! command -v sing-box >/dev/null 2>&1; then
             log_error "Sing-Box 安装失败"
             exit 1
@@ -52,25 +52,34 @@ check_install_deps() {
 # 3. 筛选低延迟域名
 get_best_domain() {
     log_info "正在筛选低延迟 Reality 目标域名..."
-    DOMAINS="c.6sc.co a.b.cdn.console.awsstatic.com assets.adobedtm.com ds-aksb-a.akamaihd.net vscjava.gallerycdn.vsassets.io prod.pa.cdn.uis.awsstatic.com s7mbrstream.scene7.com s0.awsstatic.com mscom.demdex.net a0.awsstatic.com amd.com aws.com www.icloud.com www.apple.com www.oracle.com cdn.bizibly.com www.xilinx.com drivers.amd.com apps.apple.com r.bing.com ocsp2.apple.com cdn.userway.org download.amd.com intel.com b.6sc.co d1.awsstatic.com d.oracleinfinity.io prod.log.shortbread.aws.dev amp-api-edge.apps.apple.com lpcdn.lpsnmedia.net www.nvidia.com c.marsflag.com ipv6.6sc.co"
+    DOMAINS="www.microsoft.com www.apple.com www.amazon.com www.nvidia.com www.amd.com www.intel.com www.google.com www.bing.com s0.awsstatic.com www.oracle.com www.cisco.com www.samsung.com www.ibm.com www.adobe.com www.dell.com www.tesla.com www.qualcomm.com azure.microsoft.com"
     
     BEST_DOMAIN=""
-    MIN_TIME=10.0
+    MIN_TIME="10.000"
 
     for d in $DOMAINS; do
-        time_cost=$(curl -o /dev/null -s -w '%{time_total}' --connect-timeout 1 "https://$d" || echo "10.0")
-        is_faster=$(awk "BEGIN {print ($time_cost < $MIN_TIME)}")
+        # 获取延迟，清洗非数字字符，失败回退 10.000
+        raw_time=$(curl -o /dev/null -s -w '%{time_total}' --connect-timeout 1 "https://$d" 2>/dev/null || true)
+        time_cost=$(printf '%s' "$raw_time" | tr -dc '0-9.')
+        
+        # 验证是否为合法浮点数，不合法则跳过
+        case "$time_cost" in
+            [0-9]*.[0-9]*) ;;
+            *) time_cost="10.000" ;;
+        esac
+
+        is_faster=$(awk -v t="$time_cost" -v m="$MIN_TIME" 'BEGIN {print (t+0 < m+0) ? 1 : 0}')
         
         if [ "$is_faster" -eq 1 ]; then
             MIN_TIME=$time_cost
             BEST_DOMAIN=$d
-            printf "   - %-20s : ${GREEN}%.3fs${NC}\n" "$d" "$time_cost"
+            printf "   - %-25s : ${GREEN}%ss${NC}\n" "$d" "$time_cost"
         else
-            printf "   - %-20s : %.3fs\n" "$d" "$time_cost"
+            printf "   - %-25s : %ss\n" "$d" "$time_cost"
         fi
     done
 
-    if [ -z "$BEST_DOMAIN" ] || [ "$MIN_TIME" = "10.0" ]; then
+    if [ -z "$BEST_DOMAIN" ] || [ "$MIN_TIME" = "10.000" ]; then
         BEST_DOMAIN="www.microsoft.com"
         log_warn "所有域名测试超时，回退默认: $BEST_DOMAIN"
     else
