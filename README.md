@@ -7,7 +7,9 @@ bash ./reinstall.sh debian 13 --ssh-key "密钥 自行替换" --ssh-port 51022
 
 # 2. 安装常用软件
 ```
-apt install vim git curl tar wget zsh -y
+apt install vim git curl tar wget zsh chrony -y
+
+systemctl enable --now chrony
 
 sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
 
