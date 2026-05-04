@@ -109,8 +109,7 @@ generate_config() {
     cat > "$CONFIG_FILE" <<EOF
 {
   "log": {
-    "disabled": false,
-    "level": "info",
+    "level": "error",
     "timestamp": true
   },
   "inbounds": [
@@ -119,14 +118,8 @@ generate_config() {
       "tag": "ss-in",
       "listen": "::",
       "listen_port": ${LISTEN_PORT},
-      "sniff": true,
-      "sniff_override_destination": true,
       "method": "${METHOD}",
-      "password": "${PASSWORD}",
-      "multiplex": {
-        "enabled": true,
-        "padding": true
-      }
+      "password": "${PASSWORD}"
     }
   ],
   "outbounds": [
