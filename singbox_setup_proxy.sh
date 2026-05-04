@@ -123,7 +123,7 @@ generate_config() {
     cat > "$CONFIG_FILE" <<EOF
 {
   "log": {
-    "level": "info",
+    "level": "error",
     "timestamp": true
   },
   "inbounds": [
