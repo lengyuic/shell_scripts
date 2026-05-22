@@ -31,11 +31,11 @@ SINGBOX_CONFIG="/etc/sing-box/config.json"
 SINGBOX_DIR="/etc/sing-box"
 NFT_CONF="/etc/nftables.conf"
 NFT_TABLE="landing_whitelist"
-NTP_SERVERS_FILE="/etc/ntp_servers.conf"
-CHRONY_CONF="/etc/chrony/chrony.conf"
-CHRONY_MARK_BEGIN="# === BEGIN setup.sh CUSTOM SOURCES ==="
-CHRONY_MARK_END="# === END setup.sh CUSTOM SOURCES ==="
 FAIL2BAN_JAILS_FILE="/etc/fail2ban_jails.conf"
+DDNS_SCRIPT="/root/ddns.sh"
+DDNS_TOKEN_FILE="/root/.cf_token"
+DDNS_ZONE_FILE="/root/.cf_zone"
+DDNS_LOG="/var/log/ddns.log"
 
 # --- Root 检查 ---
 check_root() {
@@ -193,301 +193,127 @@ task_install_common() {
 }
 
 # ================================================================
-# NTP (chrony) 模块
+# 时间同步 / 时区设置 模块  (统一使用 chrony)
 # ================================================================
-ntp_status() {
-    printf "${MAGENTA}--- NTP (chrony) 状态 ---${NC}\n"
 
-    if command -v chronyd >/dev/null 2>&1; then
-        printf "  安装状态: ${GREEN}已安装${NC}\n"
-        installed=1
+# Debian 服务名是 chrony, CentOS/Alpine 是 chronyd
+ts_chrony_svc() {
+    if systemctl list-unit-files 2>/dev/null | grep -q "^chronyd\.service"; then
+        echo "chronyd"
     else
-        printf "  安装状态: ${RED}未安装${NC}\n"
-        installed=0
+        echo "chrony"
     fi
-
-    if [ "$installed" -eq 1 ] && systemctl is-active --quiet chrony 2>/dev/null; then
-        printf "  服务状态: ${GREEN}已启用${NC}\n"
-        running=1
-    else
-        printf "  服务状态: ${YELLOW}未启用${NC}\n"
-        running=0
-    fi
-
-    # 时区
-    tz=$(timedatectl show -p Timezone --value 2>/dev/null)
-    [ -z "$tz" ] && tz=$(cat /etc/timezone 2>/dev/null)
-    [ -z "$tz" ] && tz=$(date +%Z)
-    printf "  当前时区: ${CYAN}%s${NC}\n" "$tz"
-
-    # 当前时间
-    printf "  当前时间: ${CYAN}%s${NC}\n" "$(date '+%Y-%m-%d %H:%M:%S  %Z %z')"
-
-    # NTP 同步状态 + 偏差
-    if [ "$running" -eq 1 ]; then
-        leap=$(chronyc tracking 2>/dev/null | awk -F: '/^Leap status/{print $2}' | sed 's/^[[:space:]]*//')
-        offset=$(chronyc tracking 2>/dev/null | awk -F: '/^Last offset/{print $2}' | sed 's/^[[:space:]]*//')
-        if [ "$leap" = "Normal" ]; then
-            if [ -n "$offset" ]; then
-                printf "  NTP 状态: ${GREEN}已同步${NC}  (偏差: ${CYAN}%s${NC})\n" "$offset"
-            else
-                printf "  NTP 状态: ${GREEN}已同步${NC}\n"
-            fi
-        else
-            printf "  NTP 状态: ${YELLOW}未同步${NC}\n"
-        fi
-    else
-        printf "  NTP 状态: ${YELLOW}未运行${NC}\n"
-    fi
-
-    printf "${MAGENTA}-------------------------${NC}\n"
 }
 
-ntp_install() {
-    printf "${BLUE}=== 安装 chrony ===${NC}\n"
-    if command -v chronyd >/dev/null 2>&1; then
-        log_warn "chrony 已经安装, 跳过"
+ts_ensure_chrony() {
+    if command -v chronyc >/dev/null 2>&1; then
         return 0
     fi
+    log_info "未检测到 chrony, 正在安装..."
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y chrony
-    log_info "chrony 安装完成"
-}
-
-ntp_uninstall() {
-    printf "${BLUE}=== 卸载 chrony ===${NC}\n"
-    if ! command -v chronyd >/dev/null 2>&1; then
-        log_warn "chrony 未安装, 无需卸载"
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y chrony; then
         return 0
     fi
-    read_input "确认卸载 chrony? (yes/no)" "no" CONFIRM
-    if [ "$CONFIRM" != "yes" ]; then
+    log_error "chrony 安装失败"
+    return 1
+}
+
+ts_status() {
+    cur_tz=$(timedatectl show --property=Timezone --value 2>/dev/null)
+    [ -z "$cur_tz" ] && cur_tz=$(cat /etc/timezone 2>/dev/null)
+    [ -z "$cur_tz" ] && cur_tz="未知"
+
+    cur_time=$(date '+%Y-%m-%d %H:%M:%S')
+    cur_tzinfo=$(date '+%Z %z')
+
+    if command -v chronyc >/dev/null 2>&1 && chronyc tracking 2>/dev/null | grep -q "Leap status.*Normal"; then
+        ntp_state="${GREEN}已同步${NC}"
+    else
+        ntp_state="${YELLOW}未同步${NC}"
+    fi
+
+    printf "${MAGENTA}--- 时间同步 / 时区 ---${NC}\n"
+    printf "  当前时区: ${CYAN}%s${NC}\n" "$cur_tz"
+    printf "  当前时间: ${CYAN}%s${NC}  ${MAGENTA}%s${NC}\n" "$cur_time" "$cur_tzinfo"
+    printf "  NTP 状态: %b\n" "$ntp_state"
+    printf "${MAGENTA}-----------------------${NC}\n"
+}
+
+# 强制立即同步一次 (chronyc makestep)
+ts_sync_time() {
+    printf "${BLUE}=== 强制同步系统时间 ===${NC}\n"
+    ts_ensure_chrony || return 1
+    svc=$(ts_chrony_svc)
+    systemctl enable "$svc" >/dev/null 2>&1 || true
+    systemctl restart "$svc" 2>/dev/null || true
+    sleep 1
+    if chronyc makestep >/dev/null 2>&1; then
+        log_info "chrony 已强制同步"
+        log_info "当前时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    else
+        log_error "chronyc makestep 失败, 请检查: systemctl status $svc"
+        return 1
+    fi
+}
+
+ts_set_beijing() {
+    printf "${BLUE}=== 设置北京时区 (Asia/Shanghai) ===${NC}\n"
+    if timedatectl set-timezone Asia/Shanghai 2>/dev/null; then
+        log_info "时区已设置为 Asia/Shanghai"
+    elif [ -f /usr/share/zoneinfo/Asia/Shanghai ]; then
+        ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+        echo "Asia/Shanghai" > /etc/timezone
+        log_info "时区已设置为 Asia/Shanghai"
+    else
+        log_error "找不到 /usr/share/zoneinfo/Asia/Shanghai, 请先安装 tzdata"
+        return 1
+    fi
+    log_info "当前时间: $(date '+%Y-%m-%d %H:%M:%S %Z %z')"
+}
+
+ts_set_custom_tz() {
+    printf "${BLUE}=== 设置自定义时区 ===${NC}\n"
+    printf "  常用参考:\n"
+    printf "    ${GREEN}Asia/Shanghai${NC}       北京 UTC+8\n"
+    printf "    ${GREEN}Asia/Tokyo${NC}          东京 UTC+9\n"
+    printf "    ${GREEN}America/New_York${NC}    纽约 UTC-5\n"
+    printf "    ${GREEN}America/Los_Angeles${NC} 洛杉矶 UTC-8\n"
+    printf "    ${GREEN}Europe/London${NC}       伦敦 UTC+0\n"
+    printf "    ${GREEN}Europe/Paris${NC}        巴黎 UTC+1\n"
+    read_input "请输入时区名称 (回车取消)" "" TZ_IN
+    if [ -z "$TZ_IN" ]; then
         log_warn "已取消"
         return 0
     fi
-    systemctl stop chrony 2>/dev/null || true
-    systemctl disable chrony 2>/dev/null || true
-    DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y chrony
-    log_info "chrony 已卸载"
-}
-
-# 把 NTP_SERVERS_FILE 写入 chrony.conf 的标记块
-ntp_apply_servers() {
-    if [ ! -f "$CHRONY_CONF" ]; then
-        log_warn "$CHRONY_CONF 不存在, 跳过自定义服务器写入"
-        return 0
-    fi
-    # 移除旧的标记块
-    if grep -qF "$CHRONY_MARK_BEGIN" "$CHRONY_CONF"; then
-        sed -i "/$CHRONY_MARK_BEGIN/,/$CHRONY_MARK_END/d" "$CHRONY_CONF"
-    fi
-    # 收集自定义服务器
-    if [ ! -f "$NTP_SERVERS_FILE" ]; then
-        return 0
-    fi
-    block=""
-    while IFS= read -r line; do
-        srv=$(printf '%s' "$line" | sed 's/#.*//' | tr -d '[:space:]')
-        [ -z "$srv" ] && continue
-        block="${block}server ${srv} iburst
-"
-    done < "$NTP_SERVERS_FILE"
-
-    if [ -n "$block" ]; then
-        {
-            echo ""
-            echo "$CHRONY_MARK_BEGIN"
-            printf "%s" "$block"
-            echo "$CHRONY_MARK_END"
-        } >> "$CHRONY_CONF"
-        log_info "已写入自定义 NTP 服务器到 $CHRONY_CONF"
-    fi
-}
-
-ntp_enable() {
-    printf "${BLUE}=== 启用 NTP ===${NC}\n"
-    if ! command -v chronyd >/dev/null 2>&1; then
-        log_error "chrony 未安装, 请先执行: 2 -> 1 安装"
+    if [ ! -f "/usr/share/zoneinfo/${TZ_IN}" ]; then
+        log_error "时区 '$TZ_IN' 不存在, 请检查拼写"
         return 1
     fi
-    ntp_apply_servers
-    systemctl enable chrony >/dev/null 2>&1 || true
-    systemctl restart chrony
-    sleep 1
-    if systemctl is-active --quiet chrony; then
-        log_info "chrony 服务运行正常"
+    if timedatectl set-timezone "$TZ_IN" 2>/dev/null; then
+        log_info "时区已设置为 $TZ_IN"
     else
-        log_error "chrony 启动失败, 请检查: systemctl status chrony"
-        return 1
+        ln -sf "/usr/share/zoneinfo/${TZ_IN}" /etc/localtime
+        echo "$TZ_IN" > /etc/timezone
+        log_info "时区已设置为 $TZ_IN"
     fi
+    log_info "当前时间: $(date '+%Y-%m-%d %H:%M:%S %Z %z')"
 }
 
-ntp_disable() {
-    printf "${BLUE}=== 禁用 NTP ===${NC}\n"
-    if ! command -v chronyd >/dev/null 2>&1; then
-        log_warn "chrony 未安装"
-        return 0
-    fi
-    systemctl stop chrony 2>/dev/null || true
-    systemctl disable chrony 2>/dev/null || true
-    log_info "chrony 已停止并取消开机自启"
-}
-
-ntp_view_detail() {
-    printf "${BLUE}=== chrony 详细状态 ===${NC}\n"
-    if ! command -v chronyc >/dev/null 2>&1; then
-        log_error "chrony 未安装"
-        return 1
-    fi
-    if ! systemctl is-active --quiet chrony 2>/dev/null; then
-        log_warn "chrony 服务未运行, 输出可能为空"
-    fi
-    printf "${CYAN}--- chronyc tracking ---${NC}\n"
-    chronyc tracking 2>/dev/null || true
-    printf "\n${CYAN}--- chronyc sources -v ---${NC}\n"
-    chronyc sources -v 2>/dev/null || true
-}
-
-ntp_force_sync() {
-    printf "${BLUE}=== 强制同步一次 (chronyc makestep) ===${NC}\n"
-    if ! command -v chronyc >/dev/null 2>&1; then
-        log_error "chrony 未安装"
-        return 1
-    fi
-    if ! systemctl is-active --quiet chrony 2>/dev/null; then
-        log_error "chrony 服务未运行, 请先启用"
-        return 1
-    fi
-    chronyc makestep
+# 开启 NTP 自动同步: 安装并启用 chrony 守护进程
+ts_enable_ntp() {
+    printf "${BLUE}=== 开启 NTP 自动同步 ===${NC}\n"
+    ts_ensure_chrony || return 1
+    svc=$(ts_chrony_svc)
+    systemctl enable "$svc" >/dev/null 2>&1 || true
+    systemctl restart "$svc" 2>/dev/null || true
     sleep 1
-    chronyc tracking 2>/dev/null | head -n 6
-}
-
-# --- NTP 服务器 CRUD ---
-ntp_servers_view() {
-    printf "${BLUE}=== 自定义 NTP 服务器列表 ===${NC}\n"
-    if [ ! -f "$NTP_SERVERS_FILE" ] || ! grep -qE '^[^#[:space:]].+' "$NTP_SERVERS_FILE" 2>/dev/null; then
-        printf "${YELLOW}  (空, 将使用 chrony 默认 pool)${NC}\n"
-        return 0
-    fi
-    i=0
-    while IFS= read -r line; do
-        srv=$(printf '%s' "$line" | sed 's/#.*//' | tr -d '[:space:]')
-        [ -z "$srv" ] && continue
-        i=$((i + 1))
-        printf "  ${CYAN}%2d)${NC} %s\n" "$i" "$srv"
-    done < "$NTP_SERVERS_FILE"
-}
-
-ntp_servers_add() {
-    read_input "请输入要添加的 NTP 服务器 (域名或 IP, 例: time.cloudflare.com)" "" NEW_SRV
-    if [ -z "$NEW_SRV" ]; then
-        log_warn "未输入, 取消"
-        return 0
-    fi
-    # 简单校验: 不含空格
-    case "$NEW_SRV" in
-        *' '*) log_error "服务器地址不能包含空格"; return 1 ;;
-    esac
-
-    mkdir -p "$(dirname "$NTP_SERVERS_FILE")"
-    touch "$NTP_SERVERS_FILE"
-
-    if grep -qxF "$NEW_SRV" "$NTP_SERVERS_FILE" 2>/dev/null; then
-        log_warn "服务器已存在: $NEW_SRV"
-        return 0
-    fi
-    echo "$NEW_SRV" >> "$NTP_SERVERS_FILE"
-    log_info "已添加: $NEW_SRV"
-
-    if systemctl is-active --quiet chrony 2>/dev/null; then
-        log_info "检测到 chrony 正在运行, 自动重新应用配置..."
-        ntp_apply_servers
-        systemctl restart chrony
-    fi
-}
-
-ntp_servers_delete() {
-    ntp_servers_view
-    if [ ! -s "$NTP_SERVERS_FILE" ] 2>/dev/null; then return 0; fi
-    read_input "请输入要删除的编号 (回车取消)" "" NUM
-    case "$NUM" in
-        ''|*[!0-9]*) log_warn "已取消"; return 0 ;;
-    esac
-
-    target=$(awk '
-        {
-            line=$0
-            sub(/#.*/,"",line)
-            gsub(/[[:space:]]/,"",line)
-            if (line!="") { i++; if (i==n) { print line; exit } }
-        }' n="$NUM" "$NTP_SERVERS_FILE")
-
-    if [ -z "$target" ]; then
-        log_error "编号无效: $NUM"
+    if systemctl is-active --quiet "$svc"; then
+        log_info "chrony 已启用 (服务: $svc)"
+    else
+        log_error "chrony 启动失败, 请检查: systemctl status $svc"
         return 1
     fi
-
-    tmp="${NTP_SERVERS_FILE}.tmp.$$"
-    grep -vxF "$target" "$NTP_SERVERS_FILE" > "$tmp" || true
-    mv "$tmp" "$NTP_SERVERS_FILE"
-    log_info "已删除: $target"
-
-    if systemctl is-active --quiet chrony 2>/dev/null; then
-        log_info "检测到 chrony 正在运行, 自动重新应用配置..."
-        ntp_apply_servers
-        systemctl restart chrony
-    fi
-}
-
-ntp_servers_modify() {
-    ntp_servers_view
-    if [ ! -s "$NTP_SERVERS_FILE" ] 2>/dev/null; then return 0; fi
-    read_input "请输入要修改的编号" "" NUM
-    case "$NUM" in
-        ''|*[!0-9]*) log_warn "已取消"; return 0 ;;
-    esac
-
-    target=$(awk '
-        {
-            line=$0
-            sub(/#.*/,"",line)
-            gsub(/[[:space:]]/,"",line)
-            if (line!="") { i++; if (i==n) { print line; exit } }
-        }' n="$NUM" "$NTP_SERVERS_FILE")
-
-    if [ -z "$target" ]; then
-        log_error "编号无效: $NUM"
-        return 1
-    fi
-
-    read_input "原服务器: $target ; 输入新值" "" NEW_SRV
-    if [ -z "$NEW_SRV" ]; then
-        log_warn "未输入, 取消"
-        return 0
-    fi
-    case "$NEW_SRV" in
-        *' '*) log_error "服务器地址不能包含空格"; return 1 ;;
-    esac
-
-    tmp="${NTP_SERVERS_FILE}.tmp.$$"
-    awk -v old="$target" -v new="$NEW_SRV" '
-        BEGIN { done=0 }
-        {
-            line=$0
-            tmp=line
-            sub(/#.*/,"",tmp)
-            gsub(/[[:space:]]/,"",tmp)
-            if (!done && tmp==old) { print new; done=1 } else { print line }
-        }' "$NTP_SERVERS_FILE" > "$tmp"
-    mv "$tmp" "$NTP_SERVERS_FILE"
-    log_info "已修改: $target -> $NEW_SRV"
-
-    if systemctl is-active --quiet chrony 2>/dev/null; then
-        log_info "检测到 chrony 正在运行, 自动重新应用配置..."
-        ntp_apply_servers
-        systemctl restart chrony
-    fi
+    log_info "当前时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
 }
 
 # ================================================================
@@ -1424,9 +1250,15 @@ nft_status() {
         printf "  安装状态: ${GREEN}已安装${NC}\n"
 
         if systemctl is-active --quiet nftables 2>/dev/null; then
-            printf "  服务状态: ${GREEN}已启用${NC}\n"
+            printf "  运行状态: ${GREEN}运行中${NC}\n"
         else
-            printf "  服务状态: ${YELLOW}未启用${NC}\n"
+            printf "  运行状态: ${YELLOW}未运行${NC}\n"
+        fi
+
+        if systemctl is-enabled --quiet nftables 2>/dev/null; then
+            printf "  自启状态: ${GREEN}已启用${NC}\n"
+        else
+            printf "  自启状态: ${YELLOW}未启用${NC}\n"
         fi
 
         # 总 table 数 (包括用户自己的)
@@ -1500,8 +1332,11 @@ firewall_enable() {
         log_warn "⚠️ 白名单 set 为空, 你将无法远程访问! 请立即添加你的 IP"
     fi
 
-    systemctl enable nftables >/dev/null 2>&1 || true
     nft_persist
+    if ! systemctl enable --now nftables >/dev/null 2>&1; then
+        log_error "nftables 服务启动失败, 请检查: systemctl status nftables"
+        return 1
+    fi
     printf "${GREEN}✅ 防火墙已启用 (白名单 IP 数: %s)${NC}\n" "$cnt"
 }
 
@@ -1565,33 +1400,52 @@ whitelist_add() {
         log_error "nftables 未安装, 请先 '安装 nftables'"
         return 1
     fi
-    read_input "请输入要添加的 IPv4 (支持 CIDR, 如 1.2.3.4 或 1.2.3.0/24)" "" NEW_IP
-    if [ -z "$NEW_IP" ]; then
-        log_warn "未输入, 取消"
-        return 0
-    fi
-    if ! validate_ipv4 "$NEW_IP"; then
-        log_error "格式不合法: $NEW_IP"
-        return 1
-    fi
 
     if ! nft_table_exists; then
         log_warn "table inet $NFT_TABLE 不存在, 正在创建..."
         nft_init_table || { log_error "创建失败"; return 1; }
     fi
 
-    if nft_get_whitelist | grep -qxF "$NEW_IP"; then
-        log_warn "IP 已存在: $NEW_IP"
-        return 0
-    fi
+    printf "${CYAN}连续添加 IPv4 白名单 (支持 CIDR, 如 1.2.3.4 或 1.2.3.0/24)${NC}\n"
+    printf "${CYAN}一行一个, 空行结束${NC}\n"
 
-    if nft add element inet "$NFT_TABLE" admin_ip4 "{ $NEW_IP }" 2>&1; then
-        log_info "已添加: $NEW_IP"
+    added=0
+    skipped=0
+    failed=0
+    while true; do
+        printf "${CYAN}IP> ${NC}"
+        if [ -r /dev/tty ]; then
+            read NEW_IP < /dev/tty
+        else
+            read NEW_IP
+        fi
+        [ -z "$NEW_IP" ] && break
+
+        if ! validate_ipv4 "$NEW_IP"; then
+            log_error "格式不合法: $NEW_IP"
+            failed=$((failed + 1))
+            continue
+        fi
+
+        if nft_get_whitelist | grep -qxF "$NEW_IP"; then
+            log_warn "已存在, 跳过: $NEW_IP"
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        if nft add element inet "$NFT_TABLE" admin_ip4 "{ $NEW_IP }" 2>/dev/null; then
+            log_info "已添加: $NEW_IP"
+            added=$((added + 1))
+        else
+            log_error "添加失败: $NEW_IP"
+            failed=$((failed + 1))
+        fi
+    done
+
+    if [ "$added" -gt 0 ]; then
         nft_persist
-    else
-        log_error "添加失败"
-        return 1
     fi
+    log_info "汇总: 新增 $added, 已存在 $skipped, 失败 $failed"
 }
 
 whitelist_delete() {
@@ -2652,6 +2506,623 @@ realm_endpoint_modify() {
 }
 
 # ================================================================
+# Cloudflare DDNS 模块
+# ================================================================
+ddns_cfg_get() {
+    key="$1"
+    [ -f "$DDNS_ZONE_FILE" ] || return 1
+    grep "^${key}=" "$DDNS_ZONE_FILE" 2>/dev/null | head -n 1 | cut -d= -f2-
+}
+
+ddns_log_path() {
+    p=$(ddns_cfg_get LOG 2>/dev/null)
+    if [ -n "$p" ]; then
+        echo "$p"
+    else
+        echo "$DDNS_LOG"
+    fi
+}
+
+ddns_cron_enabled() {
+    command -v crontab >/dev/null 2>&1 || return 1
+    crontab -l 2>/dev/null | grep -q "ddns.sh"
+}
+
+ddns_status() {
+    printf "${MAGENTA}--- Cloudflare DDNS 状态 ---${NC}\n"
+    if [ ! -f "$DDNS_SCRIPT" ]; then
+        printf "  安装状态: ${RED}未安装${NC}\n"
+        printf "${MAGENTA}---------------------------${NC}\n"
+        return 0
+    fi
+    printf "  安装状态: ${GREEN}已安装${NC}\n"
+
+    if [ -f "$DDNS_ZONE_FILE" ]; then
+        d_domain=$(ddns_cfg_get DOMAIN)
+        d_zone=$(ddns_cfg_get ZONE)
+        d_mode=$(ddns_cfg_get MODE)
+        d_proxied=$(ddns_cfg_get PROXIED)
+        d_ttl=$(ddns_cfg_get TTL)
+        [ "$d_mode" = "dual" ] && mode_label="IPv4 + IPv6" || mode_label="仅 IPv4"
+        [ "$d_proxied" = "true" ] && proxy_label="开启" || proxy_label="关闭"
+        printf "  域名:     ${CYAN}%s${NC}\n" "$d_domain"
+        printf "  Zone:     ${CYAN}%s${NC}\n" "$d_zone"
+        printf "  记录模式: ${CYAN}%s${NC}\n" "$mode_label"
+        printf "  CF 代理:  ${CYAN}%s${NC}\n" "$proxy_label"
+        printf "  TTL:      ${CYAN}%s${NC}\n" "${d_ttl:-60}"
+    fi
+
+    if ddns_cron_enabled; then
+        printf "  自动更新: ${GREEN}已启用 (每5分钟)${NC}\n"
+    else
+        printf "  自动更新: ${YELLOW}未启用${NC}\n"
+    fi
+
+    log=$(ddns_log_path)
+    if [ -f "$log" ]; then
+        last=$(tail -n 1 "$log" 2>/dev/null)
+        [ -n "$last" ] && printf "  最近日志: ${CYAN}%s${NC}\n" "$last"
+    fi
+    printf "${MAGENTA}---------------------------${NC}\n"
+}
+
+# 由完整域名向上递归查找 Cloudflare zone, 输出 ZONE_NAME|ZONE_ID, 失败返回 1
+ddns_resolve_zone() {
+    domain="$1"
+    token="$2"
+    candidate="$domain"
+    while [ -n "$candidate" ]; do
+        case "$candidate" in
+            *.*) ;;
+            *) return 1 ;;
+        esac
+        resp=$(curl -s --max-time 10 \
+            "https://api.cloudflare.com/client/v4/zones?name=${candidate}" \
+            -H "Authorization: Bearer ${token}")
+        ok=$(printf '%s' "$resp" | python3 -c \
+            "import sys,json; print(json.load(sys.stdin).get('success', ''))" 2>/dev/null)
+        if [ "$ok" != "True" ]; then
+            return 2
+        fi
+        count=$(printf '%s' "$resp" | python3 -c \
+            "import sys,json; print(len(json.load(sys.stdin)['result']))" 2>/dev/null)
+        if [ -n "$count" ] && [ "$count" != "0" ]; then
+            zid=$(printf '%s' "$resp" | python3 -c \
+                "import sys,json; print(json.load(sys.stdin)['result'][0]['id'])" 2>/dev/null)
+            echo "${candidate}|${zid}"
+            return 0
+        fi
+        new_candidate=$(printf '%s' "$candidate" | cut -d. -f2-)
+        [ "$new_candidate" = "$candidate" ] && return 1
+        candidate="$new_candidate"
+    done
+    return 1
+}
+
+ddns_install() {
+    printf "${BLUE}=== 配置 Cloudflare DDNS ===${NC}\n"
+
+    # 依赖安装
+    need_pkgs=""
+    command -v curl    >/dev/null 2>&1 || need_pkgs="$need_pkgs curl"
+    command -v python3 >/dev/null 2>&1 || need_pkgs="$need_pkgs python3"
+    command -v crontab >/dev/null 2>&1 || need_pkgs="$need_pkgs cron"
+    if [ -n "$need_pkgs" ]; then
+        log_info "安装依赖:$need_pkgs"
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y $need_pkgs
+    fi
+    systemctl enable cron >/dev/null 2>&1 || true
+    systemctl start cron 2>/dev/null || true
+
+    read_input "请输入完整域名 (如 home.example.com)" "" DDNS_DOMAIN
+    if [ -z "$DDNS_DOMAIN" ]; then log_warn "已取消"; return 0; fi
+    case "$DDNS_DOMAIN" in
+        *.*) ;;
+        *) log_error "域名格式不合法: $DDNS_DOMAIN"; return 1 ;;
+    esac
+
+    read_input "请输入 Cloudflare API Token (Zone:DNS:Edit 权限)" "" DDNS_TOKEN
+    if [ -z "$DDNS_TOKEN" ]; then log_warn "已取消"; return 0; fi
+
+    read_input "记录模式 (1=仅IPv4, 2=IPv4+IPv6)" "1" DDNS_MODE_CH
+    case "$DDNS_MODE_CH" in
+        2) DDNS_MODE="dual" ;;
+        *) DDNS_MODE="ipv4" ;;
+    esac
+
+    read_input "是否启用 Cloudflare 代理(橙云)? (yes/no)" "no" DDNS_PROXY_CH
+    case "$DDNS_PROXY_CH" in
+        yes|y|Y|YES) DDNS_PROXIED="true" ;;
+        *)           DDNS_PROXIED="false" ;;
+    esac
+
+    read_input "TTL 秒数" "60" DDNS_TTL
+    case "$DDNS_TTL" in
+        ''|*[!0-9]*) DDNS_TTL="60" ;;
+    esac
+
+    log_info "向上递归查找 Cloudflare zone..."
+    zone_line=$(ddns_resolve_zone "$DDNS_DOMAIN" "$DDNS_TOKEN")
+    rc=$?
+    if [ "$rc" -eq 2 ]; then
+        log_error "Token 验证失败, 请检查 Token 权限"
+        return 1
+    fi
+    if [ "$rc" -ne 0 ] || [ -z "$zone_line" ]; then
+        log_error "找不到 ${DDNS_DOMAIN} 对应的 Cloudflare Zone, 请确认域名已托管"
+        return 1
+    fi
+    DDNS_ZONE_NAME=$(printf '%s' "$zone_line" | cut -d'|' -f1)
+    ZONE_ID=$(printf '%s' "$zone_line" | cut -d'|' -f2)
+    log_info "Zone: ${DDNS_ZONE_NAME}  (ID: ${ZONE_ID})"
+
+    printf "\n${CYAN}--- 配置确认 ---${NC}\n"
+    printf "  域名:    ${CYAN}%s${NC}\n" "$DDNS_DOMAIN"
+    printf "  Zone:    ${CYAN}%s${NC}\n" "$DDNS_ZONE_NAME"
+    [ "$DDNS_MODE" = "dual" ]    && pm="IPv4 + IPv6" || pm="仅 IPv4"
+    [ "$DDNS_PROXIED" = "true" ] && pp="开启"       || pp="关闭"
+    printf "  模式:    ${CYAN}%s${NC}\n" "$pm"
+    printf "  CF 代理: ${CYAN}%s${NC}\n" "$pp"
+    printf "  TTL:     ${CYAN}%s${NC}\n" "$DDNS_TTL"
+    read_input "确认安装? (yes/no)" "yes" CONFIRM
+    case "$CONFIRM" in
+        yes|y|Y|YES) ;;
+        *) log_warn "已取消"; return 0 ;;
+    esac
+
+    # A 记录: 不存在则创建占位
+    rec=$(curl -s --max-time 10 \
+        "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?name=${DDNS_DOMAIN}&type=A" \
+        -H "Authorization: Bearer ${DDNS_TOKEN}")
+    rec_count=$(printf '%s' "$rec" | python3 -c \
+        "import sys,json; print(len(json.load(sys.stdin)['result']))" 2>/dev/null)
+    if [ "$rec_count" = "0" ]; then
+        log_warn "未找到 A 记录, 自动创建占位..."
+        body=$(printf '{"type":"A","name":"%s","content":"1.1.1.1","ttl":%s,"proxied":%s}' \
+            "$DDNS_DOMAIN" "$DDNS_TTL" "$DDNS_PROXIED")
+        cr=$(curl -s -X POST --max-time 10 \
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
+            -H "Authorization: Bearer ${DDNS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$body")
+        ok=$(printf '%s' "$cr" | python3 -c \
+            "import sys,json; print(json.load(sys.stdin).get('success',''))" 2>/dev/null)
+        if [ "$ok" = "True" ]; then
+            log_info "A 记录已创建"
+        else
+            log_error "创建 A 记录失败"
+            return 1
+        fi
+    else
+        log_info "A 记录已存在"
+    fi
+
+    # AAAA 记录
+    if [ "$DDNS_MODE" = "dual" ]; then
+        rec=$(curl -s --max-time 10 \
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?name=${DDNS_DOMAIN}&type=AAAA" \
+            -H "Authorization: Bearer ${DDNS_TOKEN}")
+        rec_count=$(printf '%s' "$rec" | python3 -c \
+            "import sys,json; print(len(json.load(sys.stdin)['result']))" 2>/dev/null)
+        if [ "$rec_count" = "0" ]; then
+            log_warn "未找到 AAAA 记录, 自动创建占位..."
+            body=$(printf '{"type":"AAAA","name":"%s","content":"::1","ttl":%s,"proxied":%s}' \
+                "$DDNS_DOMAIN" "$DDNS_TTL" "$DDNS_PROXIED")
+            cr=$(curl -s -X POST --max-time 10 \
+                "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
+                -H "Authorization: Bearer ${DDNS_TOKEN}" \
+                -H "Content-Type: application/json" \
+                --data "$body")
+            ok=$(printf '%s' "$cr" | python3 -c \
+                "import sys,json; print(json.load(sys.stdin).get('success',''))" 2>/dev/null)
+            if [ "$ok" = "True" ]; then
+                log_info "AAAA 记录已创建"
+            else
+                log_warn "AAAA 记录创建失败, 降级为仅 IPv4"
+                DDNS_MODE="ipv4"
+            fi
+        else
+            log_info "AAAA 记录已存在"
+        fi
+    fi
+
+    # 持久化配置
+    echo "$DDNS_TOKEN" > "$DDNS_TOKEN_FILE"
+    chmod 600 "$DDNS_TOKEN_FILE"
+    touch "$DDNS_LOG" 2>/dev/null || true
+    chmod 644 "$DDNS_LOG" 2>/dev/null || true
+
+    {
+        echo "DOMAIN=${DDNS_DOMAIN}"
+        echo "ZONE=${DDNS_ZONE_NAME}"
+        echo "MODE=${DDNS_MODE}"
+        echo "PROXIED=${DDNS_PROXIED}"
+        echo "TTL=${DDNS_TTL}"
+        echo "LOG=${DDNS_LOG}"
+    } > "$DDNS_ZONE_FILE"
+
+    # 写入执行脚本
+    cat > "$DDNS_SCRIPT" <<'DDNS_INNER'
+#!/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+DOMAIN="__DOMAIN__"
+ZONE="__ZONE__"
+MODE="__MODE__"
+PROXIED="__PROXIED__"
+TTL="__TTL__"
+TOKEN_FILE="/root/.cf_token"
+LOG_FILE="/var/log/ddns.log"
+
+API_TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null)
+[ -z "$API_TOKEN" ] && exit 1
+
+# 日志轮转 (>500 行截尾)
+if [ -f "$LOG_FILE" ]; then
+    LOG_LINES=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$LOG_LINES" -gt 500 ]; then
+        tail -n 500 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+    fi
+fi
+
+CURRENT_IP4=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null \
+    || curl -4 -s --max-time 5 https://ifconfig.me/ip 2>/dev/null \
+    || curl -4 -s --max-time 5 https://ip.sb 2>/dev/null)
+CURRENT_IP4=$(printf '%s' "$CURRENT_IP4" | tr -d '\r\n ')
+
+CURRENT_IP6=""
+if [ "$MODE" = "dual" ]; then
+    CURRENT_IP6=$(curl -6 -s --max-time 5 https://api64.ipify.org 2>/dev/null \
+        || curl -6 -s --max-time 5 https://ipv6.icanhazip.com 2>/dev/null)
+    CURRENT_IP6=$(printf '%s' "$CURRENT_IP6" | tr -d '\r\n ')
+fi
+
+if [ -z "$CURRENT_IP4" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: 无法获取公网 IPv4" >> "$LOG_FILE"
+    exit 1
+fi
+if ! echo "$CURRENT_IP4" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: 获取到的 IP 非法 ${CURRENT_IP4}" >> "$LOG_FILE"
+    exit 1
+fi
+
+ZONE_ID=$(curl -s --max-time 8 "https://api.cloudflare.com/client/v4/zones?name=${ZONE}" \
+    -H "Authorization: Bearer ${API_TOKEN}" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin)['result'][0]['id'])" 2>/dev/null)
+if [ -z "$ZONE_ID" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: 获取 Zone ID 失败" >> "$LOG_FILE"
+    exit 1
+fi
+
+update_record() {
+    TYPE="$1"
+    NEW_IP="$2"
+    [ -z "$NEW_IP" ] && return 0
+    RECORD_ID=$(curl -s --max-time 8 \
+        "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?name=${DOMAIN}&type=${TYPE}" \
+        -H "Authorization: Bearer ${API_TOKEN}" | \
+        python3 -c "import sys,json; print(json.load(sys.stdin)['result'][0]['id'])" 2>/dev/null)
+    if [ -z "$RECORD_ID" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: ${TYPE} 记录不存在" >> "$LOG_FILE"
+        return 1
+    fi
+    OLD_IP=$(curl -s --max-time 8 \
+        "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${RECORD_ID}" \
+        -H "Authorization: Bearer ${API_TOKEN}" | \
+        python3 -c "import sys,json; print(json.load(sys.stdin)['result']['content'])" 2>/dev/null)
+    if [ -z "$OLD_IP" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: ${TYPE} 无法获取当前记录值, 跳过" >> "$LOG_FILE"
+        return 0
+    fi
+    if [ "$NEW_IP" = "$OLD_IP" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] OK: ${TYPE} 未变化 ${NEW_IP}" >> "$LOG_FILE"
+        return 0
+    fi
+    JSON_BODY=$(printf '{"type":"%s","name":"%s","content":"%s","ttl":%s,"proxied":%s}' \
+        "$TYPE" "$DOMAIN" "$NEW_IP" "$TTL" "$PROXIED")
+    RESULT=$(curl -s -X PUT --max-time 10 \
+        "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${RECORD_ID}" \
+        -H "Authorization: Bearer ${API_TOKEN}" \
+        -H "Content-Type: application/json" \
+        --data "$JSON_BODY")
+    SUCCESS=$(echo "$RESULT" | python3 -c \
+        "import sys,json; print(json.load(sys.stdin).get('success'))" 2>/dev/null)
+    if [ "$SUCCESS" = "True" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] OK: ${TYPE} 更新成功 ${OLD_IP} -> ${NEW_IP}" >> "$LOG_FILE"
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: ${TYPE} 更新失败 $RESULT" >> "$LOG_FILE"
+        return 1
+    fi
+}
+
+update_record A "$CURRENT_IP4"
+if [ "$MODE" = "dual" ] && [ -n "$CURRENT_IP6" ]; then
+    update_record AAAA "$CURRENT_IP6"
+fi
+DDNS_INNER
+
+    sed -i "s|__DOMAIN__|${DDNS_DOMAIN}|g"      "$DDNS_SCRIPT"
+    sed -i "s|__ZONE__|${DDNS_ZONE_NAME}|g"     "$DDNS_SCRIPT"
+    sed -i "s|__MODE__|${DDNS_MODE}|g"          "$DDNS_SCRIPT"
+    sed -i "s|__PROXIED__|${DDNS_PROXIED}|g"    "$DDNS_SCRIPT"
+    sed -i "s|__TTL__|${DDNS_TTL}|g"            "$DDNS_SCRIPT"
+    chmod 700 "$DDNS_SCRIPT"
+
+    cron_job="*/5 * * * * ${DDNS_SCRIPT} >> ${DDNS_LOG} 2>&1"
+    ( crontab -l 2>/dev/null | grep -v "ddns.sh"; echo "$cron_job" ) | crontab -
+    log_info "crontab 已设置 (每5分钟自动更新)"
+
+    log_info "立即执行一次测试..."
+    if sh "$DDNS_SCRIPT"; then
+        tail -n 1 "$DDNS_LOG" 2>/dev/null | while IFS= read -r l; do
+            printf "  ${GREEN}%s${NC}\n" "$l"
+        done
+    else
+        log_error "测试执行失败, 请查看日志: $DDNS_LOG"
+    fi
+    log_info "DDNS 配置完成: $DDNS_DOMAIN"
+}
+
+ddns_run_now() {
+    if [ ! -f "$DDNS_SCRIPT" ]; then
+        log_error "DDNS 未安装"
+        return 1
+    fi
+    log_info "正在手动更新..."
+    if sh "$DDNS_SCRIPT"; then
+        log=$(ddns_log_path)
+        tail -n 1 "$log" 2>/dev/null | while IFS= read -r l; do
+            printf "  ${GREEN}%s${NC}\n" "$l"
+        done
+    else
+        log_error "更新失败, 请查看日志"
+    fi
+}
+
+ddns_view_logs() {
+    log=$(ddns_log_path)
+    if [ ! -f "$log" ]; then
+        log_warn "日志文件不存在: $log"
+        return 0
+    fi
+    printf "${CYAN}--- %s (尾部 30 行) ---${NC}\n" "$log"
+    tail -n 30 "$log" | while IFS= read -r line; do
+        case "$line" in
+            *ERROR*)    printf "  ${RED}%s${NC}\n" "$line" ;;
+            *"更新成功"*) printf "  ${GREEN}%s${NC}\n" "$line" ;;
+            *)          printf "  %s\n" "$line" ;;
+        esac
+    done
+}
+
+ddns_pause() {
+    if [ ! -f "$DDNS_SCRIPT" ]; then
+        log_error "DDNS 未安装"
+        return 1
+    fi
+    if ! command -v crontab >/dev/null 2>&1; then
+        log_warn "未安装 cron"
+        return 0
+    fi
+    ( crontab -l 2>/dev/null | grep -v "ddns.sh" ) | crontab - 2>/dev/null
+    log_info "DDNS 自动更新已暂停"
+}
+
+ddns_resume() {
+    if [ ! -f "$DDNS_SCRIPT" ]; then
+        log_error "DDNS 未安装"
+        return 1
+    fi
+    if ! command -v crontab >/dev/null 2>&1; then
+        log_info "安装 cron..."
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y cron
+        systemctl enable cron >/dev/null 2>&1 || true
+        systemctl start cron 2>/dev/null || true
+    fi
+    log=$(ddns_log_path)
+    cron_job="*/5 * * * * ${DDNS_SCRIPT} >> ${log} 2>&1"
+    ( crontab -l 2>/dev/null | grep -v "ddns.sh"; echo "$cron_job" ) | crontab -
+    log_info "DDNS 自动更新已恢复 (每5分钟)"
+}
+
+ddns_uninstall() {
+    printf "${BLUE}=== 卸载 DDNS ===${NC}\n"
+    if [ ! -f "$DDNS_SCRIPT" ] && [ ! -f "$DDNS_TOKEN_FILE" ] && [ ! -f "$DDNS_ZONE_FILE" ]; then
+        log_warn "DDNS 未安装, 无需卸载"
+        return 0
+    fi
+    read_input "确认卸载 DDNS? 将移除 cron / 脚本 / Token (yes/no)" "no" CONFIRM
+    if [ "$CONFIRM" != "yes" ]; then
+        log_warn "已取消"
+        return 0
+    fi
+    if command -v crontab >/dev/null 2>&1; then
+        ( crontab -l 2>/dev/null | grep -v "ddns.sh" ) | crontab - 2>/dev/null
+    fi
+    rm -f "$DDNS_SCRIPT" "$DDNS_TOKEN_FILE" "$DDNS_ZONE_FILE"
+    log_info "DDNS 已卸载 (日志文件保留: $DDNS_LOG)"
+}
+
+# ================================================================
+# SSH 工具模块
+# ================================================================
+SSHD_CONFIG="/etc/ssh/sshd_config"
+
+ssh_auth_keys_file() {
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "/root/.ssh/authorized_keys"
+    else
+        echo "$HOME/.ssh/authorized_keys"
+    fi
+}
+
+ssh_count_keys() {
+    f=$(ssh_auth_keys_file)
+    if [ -f "$f" ]; then
+        grep -cE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2|sk-ssh|sk-ecdsa|ssh-dss) ' "$f" 2>/dev/null
+    else
+        echo 0
+    fi
+}
+
+ssh_restart() {
+    if ! sshd -t 2>/dev/null; then
+        log_error "sshd 配置语法错误, 取消重启"
+        return 1
+    fi
+    if systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; then
+        log_info "SSH 服务已重启"
+    else
+        log_error "SSH 重启失败, 请手动执行: systemctl restart sshd"
+        return 1
+    fi
+}
+
+ssh_status() {
+    cur_port=$(get_ssh_port)
+    pwd_auth=$(grep -E "^[[:space:]]*PasswordAuthentication[[:space:]]" "$SSHD_CONFIG" 2>/dev/null \
+        | tail -n 1 | awk '{print $2}')
+    [ -z "$pwd_auth" ] && pwd_auth="(默认 yes)"
+    pubkey_auth=$(grep -E "^[[:space:]]*PubkeyAuthentication[[:space:]]" "$SSHD_CONFIG" 2>/dev/null \
+        | tail -n 1 | awk '{print $2}')
+    [ -z "$pubkey_auth" ] && pubkey_auth="(默认 yes)"
+    keys_file=$(ssh_auth_keys_file)
+    key_count=$(ssh_count_keys)
+
+    printf "${MAGENTA}--- SSH 状态 ---${NC}\n"
+    printf "  当前端口:               ${CYAN}%s${NC}\n" "$cur_port"
+    printf "  PasswordAuthentication: ${CYAN}%s${NC}\n" "$pwd_auth"
+    printf "  PubkeyAuthentication:   ${CYAN}%s${NC}\n" "$pubkey_auth"
+    printf "  公钥数量 (%s): ${CYAN}%s${NC}\n" "$keys_file" "$key_count"
+    printf "${MAGENTA}----------------${NC}\n"
+}
+
+ssh_add_key() {
+    printf "${BLUE}=== 添加 SSH 公钥 ===${NC}\n"
+    keys_file=$(ssh_auth_keys_file)
+    keys_dir=$(dirname "$keys_file")
+    mkdir -p "$keys_dir"
+    chmod 700 "$keys_dir"
+    touch "$keys_file"
+
+    printf "${CYAN}支持连续添加, 每行一个完整公钥 (ssh-ed25519 / ssh-rsa ...)${NC}\n"
+    printf "${CYAN}空行结束${NC}\n"
+
+    added=0
+    skipped=0
+    invalid=0
+    while true; do
+        printf "${CYAN}pubkey> ${NC}"
+        if [ -r /dev/tty ]; then
+            read PUBKEY < /dev/tty
+        else
+            read PUBKEY
+        fi
+        [ -z "$PUBKEY" ] && break
+
+        case "$PUBKEY" in
+            "ssh-rsa "*|"ssh-ed25519 "*|"ecdsa-sha2-"*" "*|"sk-ssh-"*" "*|"sk-ecdsa-"*" "*|"ssh-dss "*)
+                ;;
+            *)
+                log_error "格式不合法, 应以 ssh-ed25519 / ssh-rsa 等开头"
+                invalid=$((invalid + 1))
+                continue
+                ;;
+        esac
+
+        # 用 类型+主体 (前两段) 比对去重, 忽略 comment 差异
+        key_body=$(printf '%s' "$PUBKEY" | awk '{print $1, $2}')
+        if grep -qF "$key_body" "$keys_file" 2>/dev/null; then
+            log_warn "已存在, 跳过"
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        echo "$PUBKEY" >> "$keys_file"
+        added=$((added + 1))
+        log_info "已添加"
+    done
+
+    chmod 600 "$keys_file"
+    total=$(ssh_count_keys)
+    log_info "汇总: 新增 $added, 已存在 $skipped, 非法 $invalid (当前公钥总数: $total)"
+}
+
+ssh_change_port() {
+    printf "${BLUE}=== 修改 SSH 端口 ===${NC}\n"
+    cur_port=$(get_ssh_port)
+    printf "  当前端口: ${CYAN}%s${NC}\n" "$cur_port"
+    read_input "请输入新端口号 (回车取消)" "" NEW_PORT
+    if [ -z "$NEW_PORT" ]; then
+        log_warn "已取消"
+        return 0
+    fi
+    case "$NEW_PORT" in
+        ''|*[!0-9]*) log_error "端口必须是数字"; return 1 ;;
+    esac
+    if [ "$NEW_PORT" -lt 1 ] || [ "$NEW_PORT" -gt 65535 ]; then
+        log_error "端口范围 1-65535"
+        return 1
+    fi
+    if [ "$NEW_PORT" = "$cur_port" ]; then
+        log_warn "端口未变化, 无需修改"
+        return 0
+    fi
+
+    cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak.$(date +%F)"
+    if grep -qE "^[[:space:]]*#?[[:space:]]*Port[[:space:]]" "$SSHD_CONFIG"; then
+        sed -i "s|^[[:space:]]*#\?[[:space:]]*Port[[:space:]].*|Port ${NEW_PORT}|" "$SSHD_CONFIG"
+    else
+        echo "Port ${NEW_PORT}" >> "$SSHD_CONFIG"
+    fi
+    log_info "已写入 Port $NEW_PORT 到 $SSHD_CONFIG"
+
+    ssh_restart || return 1
+
+    printf "${YELLOW}⚠️  请保持当前 SSH 连接不断开, 新开终端测试新端口:${NC}\n"
+    printf "    ${CYAN}ssh -p %s 用户@服务器IP${NC}\n" "$NEW_PORT"
+    printf "${YELLOW}确认登录成功后再关闭当前会话!${NC}\n"
+    if command -v nft >/dev/null 2>&1 && nft_table_exists; then
+        printf "${YELLOW}注意: 当前已启用 nft 白名单, 别忘了在防火墙中放行新端口或来源 IP${NC}\n"
+    fi
+}
+
+ssh_disable_password() {
+    printf "${BLUE}=== 关闭密码登录 (仅密钥) ===${NC}\n"
+    keys_file=$(ssh_auth_keys_file)
+    key_count=$(ssh_count_keys)
+    if [ "$key_count" -eq 0 ]; then
+        log_error "$keys_file 内没有任何公钥, 关闭密码登录会直接锁死!"
+        log_error "请先用 '添加 SSH 公钥' 录入至少一个公钥再来"
+        return 1
+    fi
+
+    printf "${YELLOW}即将执行以下修改:${NC}\n"
+    printf "  - PubkeyAuthentication             = ${GREEN}yes${NC}\n"
+    printf "  - PasswordAuthentication           = ${RED}no${NC}\n"
+    printf "  - KbdInteractiveAuthentication     = ${RED}no${NC}\n"
+    printf "  - ChallengeResponseAuthentication  = ${RED}no${NC}\n"
+    printf "  当前 ${CYAN}%s${NC} 公钥数: ${CYAN}%s${NC}\n" "$keys_file" "$key_count"
+    read_input "确认继续? (yes/no)" "no" CONFIRM
+    if [ "$CONFIRM" != "yes" ]; then
+        log_warn "已取消"
+        return 0
+    fi
+
+    cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak.$(date +%F)"
+    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/g'             "$SSHD_CONFIG"
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/g'          "$SSHD_CONFIG"
+    sed -i 's/^#\?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/g' "$SSHD_CONFIG"
+    sed -i 's/^#\?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/g' "$SSHD_CONFIG"
+
+    ssh_restart || return 1
+    log_info "已切换为仅密钥登录"
+    printf "${YELLOW}⚠️  请保持当前连接不断开, 新开终端用密钥登录验证后再退出!${NC}\n"
+}
+
+# ================================================================
 # 系统重装 (reinstall.sh) 任务
 # ================================================================
 task_system_reinstall() {
@@ -2818,49 +3289,17 @@ task_system_reinstall() {
 }
 
 # ================================================================
-# 子菜单: NTP 服务器 (增删改查)
-# ================================================================
-menu_ntp_servers() {
-    while true; do
-        printf "\n${BLUE}====== 配置 NTP 服务器 (增删改查) ======${NC}\n"
-        ntp_servers_view
-        printf "  ${GREEN}1)${NC}  添加\n"
-        printf "  ${GREEN}2)${NC}  删除\n"
-        printf "  ${GREEN}3)${NC}  修改\n"
-        printf "  ${GREEN}4)${NC}  查看\n"
-        printf "  ${RED}0)${NC}  返回上层\n"
-        printf "  ${RED}00)${NC} 返回主菜单\n"
-        printf "  ${RED}q)${NC}  退出脚本\n"
-        printf "${CYAN}请选择: ${NC}"
-        if [ -r /dev/tty ]; then read choice < /dev/tty; else read choice; fi
-
-        case "$choice" in
-            1)    ntp_servers_add; press_to_continue ;;
-            2)    ntp_servers_delete; press_to_continue ;;
-            3)    ntp_servers_modify; press_to_continue ;;
-            4)    ntp_servers_view; press_to_continue ;;
-            0)    return 0 ;;
-            00)   return 99 ;;
-            q|Q)  exit 0 ;;
-            *)    log_warn "无效选项: $choice"; press_to_continue ;;
-        esac
-    done
-}
-
-# ================================================================
-# 子菜单: NTP
+# 子菜单: 时间同步 / 时区
 # ================================================================
 menu_ntp() {
     while true; do
-        printf "\n${BLUE}========== NTP (chrony) 配置 ==========${NC}\n"
-        ntp_status
-        printf "  ${GREEN}1)${NC}  安装 chrony\n"
-        printf "  ${GREEN}2)${NC}  卸载 chrony\n"
-        printf "  ${GREEN}3)${NC}  启用 NTP\n"
-        printf "  ${GREEN}4)${NC}  禁用 NTP\n"
-        printf "  ${GREEN}5)${NC}  查看详细状态\n"
-        printf "  ${GREEN}6)${NC}  配置 NTP 服务器 (增删改查) ${MAGENTA}>${NC}\n"
-        printf "  ${GREEN}7)${NC}  强制同步一次\n"
+        printf "\n${BLUE}========== 时间同步 / 时区设置 ==========${NC}\n"
+        ts_status
+        printf "  ${GREEN}1)${NC}  强制同步时间\n"
+        printf "  ${GREEN}2)${NC}  设置北京时区 (Asia/Shanghai)\n"
+        printf "  ${GREEN}3)${NC}  一键: 北京时区 + 强制同步\n"
+        printf "  ${GREEN}4)${NC}  设置自定义时区\n"
+        printf "  ${GREEN}5)${NC}  开启 NTP 自动同步\n"
         printf "  ${RED}0)${NC}  返回上层\n"
         printf "  ${RED}00)${NC} 返回主菜单\n"
         printf "  ${RED}q)${NC}  退出脚本\n"
@@ -2868,13 +3307,11 @@ menu_ntp() {
         if [ -r /dev/tty ]; then read choice < /dev/tty; else read choice; fi
 
         case "$choice" in
-            1)    ntp_install; press_to_continue ;;
-            2)    ntp_uninstall; press_to_continue ;;
-            3)    ntp_enable; press_to_continue ;;
-            4)    ntp_disable; press_to_continue ;;
-            5)    ntp_view_detail; press_to_continue ;;
-            6)    menu_ntp_servers; _r=$?; [ "$_r" -eq 99 ] && return 99 ;;
-            7)    ntp_force_sync; press_to_continue ;;
+            1)    ts_sync_time; press_to_continue ;;
+            2)    ts_set_beijing; press_to_continue ;;
+            3)    ts_set_beijing; ts_sync_time; press_to_continue ;;
+            4)    ts_set_custom_tz; press_to_continue ;;
+            5)    ts_enable_ntp; press_to_continue ;;
             0)    return 0 ;;
             00)   return 99 ;;
             q|Q)  exit 0 ;;
@@ -3014,8 +3451,13 @@ menu_singbox() {
 menu_firewall_ip() {
     while true; do
         printf "\n${BLUE}====== 配置入站 IP (增删改查) ======${NC}\n"
-        whitelist_view
-        printf "  ${GREEN}1)${NC}  添加\n"
+        if nft_table_exists; then
+            cnt=$(nft_get_whitelist | grep -c .)
+            printf "  ${MAGENTA}当前白名单 IP 数:${NC} ${CYAN}%s${NC}  ${MAGENTA}(选 4 查看明细)${NC}\n" "$cnt"
+        else
+            printf "  ${MAGENTA}(table inet %s 不存在, 添加 IP 时会自动创建)${NC}\n" "$NFT_TABLE"
+        fi
+        printf "  ${GREEN}1)${NC}  添加 (支持连续输入, 空行结束)\n"
         printf "  ${GREEN}2)${NC}  删除\n"
         printf "  ${GREEN}3)${NC}  修改\n"
         printf "  ${GREEN}4)${NC}  查看\n"
@@ -3171,6 +3613,81 @@ menu_tcp_tune() {
     done
 }
 
+# ================================================================
+# 子菜单: Cloudflare DDNS
+# ================================================================
+menu_ddns() {
+    while true; do
+        printf "\n${BLUE}========== Cloudflare DDNS ==========${NC}\n"
+        ddns_status
+        if [ ! -f "$DDNS_SCRIPT" ]; then
+            printf "  ${GREEN}1)${NC}  安装并配置 DDNS\n"
+        else
+            printf "  ${GREEN}1)${NC}  重新配置 DDNS\n"
+            printf "  ${GREEN}2)${NC}  立即手动更新一次\n"
+            printf "  ${GREEN}3)${NC}  查看日志\n"
+            if ddns_cron_enabled; then
+                printf "  ${YELLOW}4)${NC}  暂停自动更新\n"
+            else
+                printf "  ${GREEN}4)${NC}  恢复自动更新\n"
+            fi
+            printf "  ${YELLOW}5)${NC}  卸载 DDNS\n"
+        fi
+        printf "  ${RED}0)${NC}  返回上层\n"
+        printf "  ${RED}00)${NC} 返回主菜单\n"
+        printf "  ${RED}q)${NC}  退出脚本\n"
+        printf "${CYAN}请选择: ${NC}"
+        if [ -r /dev/tty ]; then read choice < /dev/tty; else read choice; fi
+
+        case "$choice" in
+            1)    ddns_install; press_to_continue ;;
+            2)    ddns_run_now; press_to_continue ;;
+            3)    ddns_view_logs; press_to_continue ;;
+            4)
+                if ddns_cron_enabled; then
+                    ddns_pause
+                else
+                    ddns_resume
+                fi
+                press_to_continue
+                ;;
+            5)    ddns_uninstall; press_to_continue ;;
+            0)    return 0 ;;
+            00)   return 99 ;;
+            q|Q)  exit 0 ;;
+            *)    log_warn "无效选项: $choice"; press_to_continue ;;
+        esac
+    done
+}
+
+# ================================================================
+# 子菜单: SSH 工具
+# ================================================================
+menu_ssh() {
+    while true; do
+        printf "\n${BLUE}========== SSH 工具 ==========${NC}\n"
+        ssh_status
+        printf "  ${GREEN}1)${NC}  添加 SSH 公钥 (支持连续输入, 空行结束)\n"
+        printf "  ${GREEN}2)${NC}  修改 SSH 端口\n"
+        printf "  ${RED}3)${NC}  关闭密码登录 (仅密钥) ${RED}⚠${NC}\n"
+        printf "  ${RED}0)${NC}  返回上层\n"
+        printf "  ${RED}00)${NC} 返回主菜单\n"
+        printf "  ${RED}q)${NC}  退出脚本\n"
+        printf "${CYAN}请选择: ${NC}"
+        if [ -r /dev/tty ]; then read choice < /dev/tty; else read choice; fi
+
+        case "$choice" in
+            1)    ssh_add_key; press_to_continue ;;
+            2)    ssh_change_port; press_to_continue ;;
+            3)    ssh_disable_password; press_to_continue ;;
+            0)    return 0 ;;
+            00)   return 99 ;;
+            q|Q)  exit 0 ;;
+            *)    log_warn "无效选项: $choice"; press_to_continue ;;
+        esac
+    done
+}
+
 menu_main() {
     while true; do
         clear 2>/dev/null || printf "\n\n"
@@ -3178,13 +3695,15 @@ menu_main() {
         printf "${BLUE}      Debian/Ubuntu VPS 一键配置脚本 (主菜单)${NC}\n"
         printf "${BLUE}========================================================${NC}\n"
         printf "  ${GREEN}1)${NC}  安装常用软件\n"
-        printf "  ${GREEN}2)${NC}  配置 NTP ${MAGENTA}>${NC}\n"
+        printf "  ${GREEN}2)${NC}  时间同步 / 时区 ${MAGENTA}>${NC}\n"
         printf "  ${GREEN}3)${NC}  Fail2Ban ${MAGENTA}>${NC}\n"
         printf "  ${GREEN}4)${NC}  Sing-Box 配置 ${MAGENTA}>${NC}\n"
         printf "  ${GREEN}5)${NC}  防火墙配置 ${MAGENTA}>${NC}\n"
         printf "  ${GREEN}6)${NC}  TCP 调优 ${MAGENTA}>${NC}\n"
         printf "  ${GREEN}7)${NC}  Realm 配置 ${MAGENTA}>${NC}\n"
-        printf "  ${RED}8)${NC}  系统重装 (DD) ${RED}⚠${NC}\n"
+        printf "  ${GREEN}8)${NC}  Cloudflare DDNS ${MAGENTA}>${NC}\n"
+        printf "  ${GREEN}9)${NC}  SSH 工具 ${MAGENTA}>${NC}\n"
+        printf "  ${RED}10)${NC} 系统重装 (DD) ${RED}⚠${NC}\n"
         printf "  ${RED}q)${NC}  退出脚本\n"
         printf "${BLUE}========================================================${NC}\n"
         printf "${CYAN}请输入选项: ${NC}"
@@ -3198,7 +3717,9 @@ menu_main() {
             5)    menu_firewall ;;
             6)    menu_tcp_tune ;;
             7)    menu_realm ;;
-            8)    task_system_reinstall; press_to_continue ;;
+            8)    menu_ddns ;;
+            9)    menu_ssh ;;
+            10)   task_system_reinstall; press_to_continue ;;
             q|Q)  printf "${GREEN}再见!${NC}\n"; exit 0 ;;
             0|00) ;;
             *)    log_warn "无效选项: $choice"; press_to_continue ;;
@@ -3209,3 +3730,4 @@ menu_main() {
 # --- 入口 ---
 check_root
 menu_main
+
