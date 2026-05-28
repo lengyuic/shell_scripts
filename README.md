@@ -1,6 +1,18 @@
-# Debian / Ubuntu VPS 一键配置脚本
+# Linux VPS 一键配置脚本（多发行版自动识别）
 
 把原本散落的多个脚本（dd 重装 / fail2ban / nftables / sing-box / realm / BBR 调优）整合成一个交互式菜单脚本 **`setup.sh`**，全部 POSIX `sh`，支持 `curl | sh` 一键运行。
+
+脚本启动时**自动识别发行版与包管理器**，安装/卸载逻辑统一走抽象层，无需手动适配：
+
+| 系族 | 代表发行版 | 包管理器 |
+|---|---|---|
+| debian | Debian / Ubuntu / Kali / Mint | `apt` |
+| rhel | RHEL / CentOS / Rocky / AlmaLinux / Fedora / Oracle / Anolis / openEuler | `dnf` / `yum` |
+| arch | Arch / Manjaro | `pacman` |
+| alpine | Alpine | `apk` |
+| suse | openSUSE / SLES | `zypper` |
+
+RHEL 系会在需要时自动启用 EPEL 仓库（fail2ban 依赖），并自动处理 `chrony`/`chronyd` 服务名、`chrony.conf` 路径、`vim-enhanced` 等发行版差异。
 
 ## 快速开始
 
@@ -29,7 +41,7 @@ sudo sh setup.sh
 q) 退出脚本
 ```
 
-带 `>` 的项是二级菜单，二级菜单内还可能有三级（如增删改查）。所有子菜单顶部默认显示该模块**实时状态**（安装状态 / 服务状态 / 关键参数）。
+带 `>` 的项是二级菜单，二级菜单内还可能有三级（如增删改查）。所有子菜单顶部默认显示该模块**实时状态**（安装状态 / 服务状态 / 关键参数）。主菜单顶部还会显示识别到的**系统**与**包管理器**。
 
 ## 导航约定
 
@@ -37,14 +49,14 @@ q) 退出脚本
 
 | 输入 | 含义 |
 |---|---|
-| `0` | 返回上层菜单 |
-| `00` | 直接返回主菜单（跨层跳） |
+| `回车` | 返回上层菜单 |
+| `m` | 直接返回主菜单（跨层跳） |
 | `q` | 退出脚本 |
 
 ## 模块说明
 
 ### 1) 安装常用软件
-一次性装好 `vim` / `git` / `curl` / `wget` / `tar` / `zsh`，并配置 oh-my-zsh（`ys` 主题）+ vim 鼠标禁用。
+一次性装好 `vim` / `git` / `curl` / `wget` / `tar` / `zsh`（RHEL 系自动用 `vim-enhanced`，且只补装缺失的命令以避开 `curl` 与 `curl-minimal` 冲突），并配置 oh-my-zsh（`ys` 主题）+ vim 鼠标禁用。
 
 ### 2) NTP (chrony)
 状态栏显示：安装 / 启用 / 当前时区 / 当前时间 / NTP 同步状态 + 偏差。
@@ -52,6 +64,7 @@ q) 退出脚本
 - 安装 / 卸载 / 启用 / 禁用 / 强制同步一次（`chronyc makestep`）
 - 详细状态（`chronyc tracking` + `chronyc sources -v`）
 - **自定义 NTP 服务器（增删改查）** — 持久化到 `/etc/ntp_servers.conf`，通过 sentinel 块（`# === BEGIN setup.sh CUSTOM SOURCES ===`）写入 `chrony.conf`，不污染原文件
+- 自动识别 chrony 的服务名（Debian 系 `chrony` / RHEL 系 `chronyd`）与配置路径（`/etc/chrony/chrony.conf` 或 `/etc/chrony.conf`）
 
 ### 3) Fail2Ban
 状态栏显示：安装 / 服务 / 启用监狱 / 当前监禁数 / SSH 端口 / 已配置监狱数。
@@ -133,7 +146,7 @@ q) 退出脚本
 |---|---|
 | `/etc/sing-box/config.json` | Sing-Box 配置（Sing-Box 模块的唯一数据源）|
 | `/etc/ntp_servers.conf` | 自定义 NTP 服务器列表 |
-| `/etc/chrony/chrony.conf` | chrony 主配置（脚本通过 sentinel 块注入自定义源）|
+| `/etc/chrony/chrony.conf` 或 `/etc/chrony.conf` | chrony 主配置（按发行版自动识别，脚本通过 sentinel 块注入自定义源）|
 | `/etc/fail2ban_jails.conf` | Fail2Ban 监狱清单 |
 | `/etc/fail2ban/jail.local` | 启用 Fail2Ban 时自动生成 |
 | `/etc/nftables.conf` | nft 规则持久化（含手动添加的其他 table）|
@@ -145,15 +158,18 @@ q) 退出脚本
 
 ## 依赖
 
-- 系统：Debian 11+ / Ubuntu 20.04+（其他基于 systemd + apt 的发行版可能也能跑）
+- 系统：基于 **systemd** 的主流发行版 —— Debian/Ubuntu、RHEL/CentOS/Rocky/AlmaLinux/Fedora、Arch、openSUSE 等（已识别 `apt`/`dnf`/`yum`/`pacman`/`apk`/`zypper`）
 - 必备工具：`curl`、`openssl`、`systemctl`、`awk`、`sed`
 - 按需自动安装：`chrony`、`fail2ban`、`nftables`、`realm`、`python3`、`tar`
 
-`python3` 仅在 Sing-Box 查看链接时用于解析 `config.json`，脚本会按需 `apt install`。
+`python3` 仅在 Sing-Box 查看链接时用于解析 `config.json`，脚本会按需调用对应包管理器安装。
+
+> 备注：脚本逻辑面向 systemd 发行版。Alpine 等使用 OpenRC（非 systemd）的系统能完成软件安装，但 `systemctl` 相关的服务启停/状态功能可能不适用。
 
 ## 设计要点
 
 1. **多数据源驱动而非缓存**：Sing-Box 直接读 `config.json`，防火墙直接读 live nft 状态，Realm 直接读 TOML 配置 —— 即使用户绕过本脚本手动改了配置，下次进菜单仍能正确显示。
 2. **不污染既有配置**：防火墙不 `flush ruleset` 重写（用增量 `nft add/delete element`），NTP 用 sentinel 块写 chrony.conf，Realm 不强制搬迁用户已有 config。
 3. **多级菜单状态可见**：每个子菜单进入时顶部展示该模块状态，无需额外操作。
-4. **统一退出语义**：所有子菜单 `0/00/q` 一致，三级菜单的 `00` 能跨层跳回主菜单。
+4. **统一退出语义**：所有子菜单 `回车/m/q` 一致，`m` 能从任意层级跨层跳回主菜单。
+5. **多发行版抽象**：启动时 `detect_os` 识别系族与包管理器，安装/卸载统一走 `pkg_install`/`pkg_remove`/`pkg_update` 封装，服务名与配置路径按发行版动态解析，无需为每个发行版维护分支逻辑。
