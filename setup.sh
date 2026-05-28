@@ -1,7 +1,9 @@
 #!/bin/sh
 
 # ================================================================
-# Debian/Ubuntu VPS 一键配置脚本 (多级菜单整合版)
+# Linux VPS 一键配置脚本 (多发行版自动识别 / 多级菜单整合版)
+# 支持: Debian/Ubuntu (apt) · RHEL/CentOS/Rocky/AlmaLinux/Fedora (dnf/yum)
+#       Arch (pacman) · Alpine (apk) · openSUSE (zypper)
 # 主菜单:
 #   1. 安装常用软件
 #   2. 配置 NTP        (子菜单)
@@ -36,6 +38,142 @@ CHRONY_CONF="/etc/chrony/chrony.conf"
 CHRONY_MARK_BEGIN="# === BEGIN setup.sh CUSTOM SOURCES ==="
 CHRONY_MARK_END="# === END setup.sh CUSTOM SOURCES ==="
 FAIL2BAN_JAILS_FILE="/etc/fail2ban_jails.conf"
+
+# ================================================================
+# 发行版检测 / 包管理抽象
+# ================================================================
+OS_ID=""
+OS_PRETTY=""
+OS_FAMILY=""
+PKG_MGR=""
+CHRONY_SERVICE="chrony"
+
+detect_os() {
+    OS_ID=""
+    OS_PRETTY=""
+    os_like=""
+    if [ -r /etc/os-release ]; then
+        OS_ID=$(. /etc/os-release 2>/dev/null; printf '%s' "$ID")
+        OS_PRETTY=$(. /etc/os-release 2>/dev/null; printf '%s' "$PRETTY_NAME")
+        os_like=$(. /etc/os-release 2>/dev/null; printf '%s' "$ID_LIKE")
+    fi
+
+    case "$OS_ID" in
+        debian|ubuntu|devuan|kali|raspbian|linuxmint|pop|deepin|zorin)
+            OS_FAMILY="debian" ;;
+        rhel|centos|rocky|almalinux|fedora|ol|oracle|anolis|opencloudos|openeuler|amzn|tencentos)
+            OS_FAMILY="rhel" ;;
+        arch|manjaro|endeavouros|cachyos)
+            OS_FAMILY="arch" ;;
+        alpine)
+            OS_FAMILY="alpine" ;;
+        opensuse*|sles|sled|suse)
+            OS_FAMILY="suse" ;;
+        *)
+            case " $os_like " in
+                *debian*|*ubuntu*)        OS_FAMILY="debian" ;;
+                *rhel*|*fedora*|*centos*) OS_FAMILY="rhel" ;;
+                *arch*)                   OS_FAMILY="arch" ;;
+                *suse*)                   OS_FAMILY="suse" ;;
+                *alpine*)                 OS_FAMILY="alpine" ;;
+                *)                        OS_FAMILY="unknown" ;;
+            esac ;;
+    esac
+
+    if   command -v apt-get >/dev/null 2>&1; then PKG_MGR="apt"
+    elif command -v dnf     >/dev/null 2>&1; then PKG_MGR="dnf"
+    elif command -v yum     >/dev/null 2>&1; then PKG_MGR="yum"
+    elif command -v pacman  >/dev/null 2>&1; then PKG_MGR="pacman"
+    elif command -v apk     >/dev/null 2>&1; then PKG_MGR="apk"
+    elif command -v zypper  >/dev/null 2>&1; then PKG_MGR="zypper"
+    else PKG_MGR=""
+    fi
+}
+
+# 刷新软件源 (dnf/yum 安装时自动刷新, 无需单独执行)
+pkg_update() {
+    case "$PKG_MGR" in
+        apt)     apt-get update -qq ;;
+        pacman)  pacman -Sy --noconfirm >/dev/null 2>&1 || true ;;
+        apk)     apk update >/dev/null 2>&1 || true ;;
+        zypper)  zypper --non-interactive refresh >/dev/null 2>&1 || true ;;
+        dnf|yum) : ;;
+        *) log_error "未检测到受支持的包管理器"; return 1 ;;
+    esac
+}
+
+# 安装一个或多个软件包
+pkg_install() {
+    [ "$#" -gt 0 ] || return 0
+    case "$PKG_MGR" in
+        apt)    DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+        dnf)    dnf install -y "$@" ;;
+        yum)    yum install -y "$@" ;;
+        pacman) pacman -S --noconfirm --needed "$@" ;;
+        apk)    apk add "$@" ;;
+        zypper) zypper --non-interactive install "$@" ;;
+        *) log_error "未检测到受支持的包管理器, 无法安装: $*"; return 1 ;;
+    esac
+}
+
+# 卸载一个或多个软件包
+pkg_remove() {
+    [ "$#" -gt 0 ] || return 0
+    case "$PKG_MGR" in
+        apt)    DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y "$@" ;;
+        dnf)    dnf remove -y "$@" ;;
+        yum)    yum remove -y "$@" ;;
+        pacman) pacman -Rns --noconfirm "$@" ;;
+        apk)    apk del "$@" ;;
+        zypper) zypper --non-interactive remove "$@" ;;
+        *) log_error "未检测到受支持的包管理器"; return 1 ;;
+    esac
+}
+
+# RHEL 系: 确保 EPEL 仓库可用 (fail2ban 等位于 EPEL)
+ensure_epel() {
+    [ "$OS_FAMILY" = "rhel" ] || return 0
+    [ "$OS_ID" = "fedora" ] && return 0
+    if rpm -q epel-release >/dev/null 2>&1; then
+        return 0
+    fi
+    log_info "启用 EPEL 仓库..."
+    case "$OS_ID" in
+        ol|oracle)
+            elv=$(rpm -E %rhel 2>/dev/null)
+            pkg_install "oracle-epel-release-el${elv}" || pkg_install epel-release || true
+            ;;
+        *)
+            pkg_install epel-release || true
+            ;;
+    esac
+}
+
+# 解析 chrony 的配置文件路径与 systemd 服务名 (各发行版不同)
+resolve_chrony() {
+    if [ -f /etc/chrony/chrony.conf ]; then
+        CHRONY_CONF="/etc/chrony/chrony.conf"
+    elif [ -f /etc/chrony.conf ]; then
+        CHRONY_CONF="/etc/chrony.conf"
+    else
+        case "$OS_FAMILY" in
+            debian|alpine) CHRONY_CONF="/etc/chrony/chrony.conf" ;;
+            *)             CHRONY_CONF="/etc/chrony.conf" ;;
+        esac
+    fi
+
+    unit_files=$(systemctl list-unit-files 2>/dev/null)
+    if printf '%s\n' "$unit_files" | grep -q '^chronyd\.service'; then
+        CHRONY_SERVICE="chronyd"
+    elif printf '%s\n' "$unit_files" | grep -q '^chrony\.service'; then
+        CHRONY_SERVICE="chrony"
+    else
+        case "$OS_FAMILY" in
+            debian) CHRONY_SERVICE="chrony" ;;
+            *)      CHRONY_SERVICE="chronyd" ;;
+        esac
+    fi
+}
 
 # --- Root 检查 ---
 check_root() {
@@ -205,8 +343,23 @@ task_install_common() {
     printf "${BLUE}=== 安装常用软件 (vim/git/curl/wget/tar/zsh + oh-my-zsh) ===${NC}\n"
     (
         set -e
-        apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y vim git curl tar wget zsh
+        pkg_update
+
+        # vim 在 RHEL 系的完整包名为 vim-enhanced
+        case "$OS_FAMILY" in
+            rhel) vim_pkg="vim-enhanced" ;;
+            *)    vim_pkg="vim" ;;
+        esac
+
+        # 只安装缺失的命令, 避免 RHEL 上 curl 与 curl-minimal 冲突
+        pkgs="$vim_pkg"
+        command -v git  >/dev/null 2>&1 || pkgs="$pkgs git"
+        command -v curl >/dev/null 2>&1 || pkgs="$pkgs curl"
+        command -v tar  >/dev/null 2>&1 || pkgs="$pkgs tar"
+        command -v wget >/dev/null 2>&1 || pkgs="$pkgs wget"
+        command -v zsh  >/dev/null 2>&1 || pkgs="$pkgs zsh"
+
+        pkg_install $pkgs
 
         if [ ! -d "$HOME/.oh-my-zsh" ]; then
             log_info "安装 oh-my-zsh..."
@@ -219,7 +372,8 @@ task_install_common() {
             sed -i 's/ZSH_THEME="robbyrussell"/ZSH_THEME="ys"/' "$HOME/.zshrc"
         fi
 
-        usermod -s /bin/zsh root
+        zsh_path=$(command -v zsh)
+        [ -n "$zsh_path" ] && usermod -s "$zsh_path" root
 
         log_info "vim 鼠标禁用: 写入 $HOME/.vimrc"
         echo "set mouse=" > "$HOME/.vimrc"
@@ -232,6 +386,7 @@ task_install_common() {
 # NTP (chrony) 模块
 # ================================================================
 ntp_status() {
+    resolve_chrony
     printf "${MAGENTA}--- NTP (chrony) 状态 ---${NC}\n"
 
     if command -v chronyd >/dev/null 2>&1; then
@@ -242,7 +397,7 @@ ntp_status() {
         installed=0
     fi
 
-    if [ "$installed" -eq 1 ] && systemctl is-active --quiet chrony 2>/dev/null; then
+    if [ "$installed" -eq 1 ] && systemctl is-active --quiet "$CHRONY_SERVICE" 2>/dev/null; then
         printf "  服务状态: ${GREEN}已启用${NC}\n"
         running=1
     else
@@ -285,8 +440,9 @@ ntp_install() {
         log_warn "chrony 已经安装, 跳过"
         return 0
     fi
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y chrony
+    pkg_update
+    pkg_install chrony
+    resolve_chrony
     log_info "chrony 安装完成"
 }
 
@@ -301,9 +457,9 @@ ntp_uninstall() {
         log_warn "已取消"
         return 0
     fi
-    systemctl stop chrony 2>/dev/null || true
-    systemctl disable chrony 2>/dev/null || true
-    DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y chrony
+    systemctl stop "$CHRONY_SERVICE" 2>/dev/null || true
+    systemctl disable "$CHRONY_SERVICE" 2>/dev/null || true
+    pkg_remove chrony
     log_info "chrony 已卸载"
 }
 
@@ -347,13 +503,13 @@ ntp_enable() {
         return 1
     fi
     ntp_apply_servers
-    systemctl enable chrony >/dev/null 2>&1 || true
-    systemctl restart chrony
+    systemctl enable "$CHRONY_SERVICE" >/dev/null 2>&1 || true
+    systemctl restart "$CHRONY_SERVICE"
     sleep 1
-    if systemctl is-active --quiet chrony; then
+    if systemctl is-active --quiet "$CHRONY_SERVICE"; then
         log_info "chrony 服务运行正常"
     else
-        log_error "chrony 启动失败, 请检查: systemctl status chrony"
+        log_error "chrony 启动失败, 请检查: systemctl status $CHRONY_SERVICE"
         return 1
     fi
 }
@@ -364,8 +520,8 @@ ntp_disable() {
         log_warn "chrony 未安装"
         return 0
     fi
-    systemctl stop chrony 2>/dev/null || true
-    systemctl disable chrony 2>/dev/null || true
+    systemctl stop "$CHRONY_SERVICE" 2>/dev/null || true
+    systemctl disable "$CHRONY_SERVICE" 2>/dev/null || true
     log_info "chrony 已停止并取消开机自启"
 }
 
@@ -375,7 +531,7 @@ ntp_view_detail() {
         log_error "chrony 未安装"
         return 1
     fi
-    if ! systemctl is-active --quiet chrony 2>/dev/null; then
+    if ! systemctl is-active --quiet "$CHRONY_SERVICE" 2>/dev/null; then
         log_warn "chrony 服务未运行, 输出可能为空"
     fi
     printf "${CYAN}--- chronyc tracking ---${NC}\n"
@@ -390,7 +546,7 @@ ntp_force_sync() {
         log_error "chrony 未安装"
         return 1
     fi
-    if ! systemctl is-active --quiet chrony 2>/dev/null; then
+    if ! systemctl is-active --quiet "$CHRONY_SERVICE" 2>/dev/null; then
         log_error "chrony 服务未运行, 请先启用"
         return 1
     fi
@@ -436,10 +592,10 @@ ntp_servers_add() {
     echo "$NEW_SRV" >> "$NTP_SERVERS_FILE"
     log_info "已添加: $NEW_SRV"
 
-    if systemctl is-active --quiet chrony 2>/dev/null; then
+    if systemctl is-active --quiet "$CHRONY_SERVICE" 2>/dev/null; then
         log_info "检测到 chrony 正在运行, 自动重新应用配置..."
         ntp_apply_servers
-        systemctl restart chrony
+        systemctl restart "$CHRONY_SERVICE"
     fi
 }
 
@@ -469,10 +625,10 @@ ntp_servers_delete() {
     mv "$tmp" "$NTP_SERVERS_FILE"
     log_info "已删除: $target"
 
-    if systemctl is-active --quiet chrony 2>/dev/null; then
+    if systemctl is-active --quiet "$CHRONY_SERVICE" 2>/dev/null; then
         log_info "检测到 chrony 正在运行, 自动重新应用配置..."
         ntp_apply_servers
-        systemctl restart chrony
+        systemctl restart "$CHRONY_SERVICE"
     fi
 }
 
@@ -519,10 +675,10 @@ ntp_servers_modify() {
     mv "$tmp" "$NTP_SERVERS_FILE"
     log_info "已修改: $target -> $NEW_SRV"
 
-    if systemctl is-active --quiet chrony 2>/dev/null; then
+    if systemctl is-active --quiet "$CHRONY_SERVICE" 2>/dev/null; then
         log_info "检测到 chrony 正在运行, 自动重新应用配置..."
         ntp_apply_servers
-        systemctl restart chrony
+        systemctl restart "$CHRONY_SERVICE"
     fi
 }
 
@@ -584,8 +740,14 @@ fail2ban_install() {
         log_warn "Fail2Ban 已经安装, 跳过"
         return 0
     fi
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban nftables
+    pkg_update
+    if [ "$OS_FAMILY" = "rhel" ]; then
+        # RHEL 系: fail2ban 位于 EPEL; systemd 后端需要 python3-systemd
+        ensure_epel
+        pkg_install fail2ban-server nftables python3-systemd || pkg_install fail2ban nftables
+    else
+        pkg_install fail2ban nftables
+    fi
     if command -v fail2ban-server >/dev/null 2>&1; then
         log_info "Fail2Ban 安装完成"
     else
@@ -607,7 +769,11 @@ fail2ban_uninstall() {
     fi
     systemctl stop fail2ban 2>/dev/null || true
     systemctl disable fail2ban 2>/dev/null || true
-    DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y fail2ban
+    if [ "$OS_FAMILY" = "rhel" ]; then
+        pkg_remove fail2ban-server fail2ban
+    else
+        pkg_remove fail2ban
+    fi
     log_info "Fail2Ban 已卸载"
 }
 
@@ -953,8 +1119,8 @@ singbox_install() {
     (
         set -e
         if ! command -v curl >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
-            apt-get update -qq >/dev/null
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl openssl ca-certificates >/dev/null
+            pkg_update >/dev/null 2>&1 || true
+            pkg_install curl openssl ca-certificates >/dev/null 2>&1
         fi
         curl -fsSL https://sing-box.app/install.sh | sh
         if command -v sing-box >/dev/null 2>&1; then
@@ -1040,8 +1206,8 @@ derive_x25519_pub_from_priv_b64url() {
 # 调用 python3 把 config.json 关键字段解析为 shell-safe 的 KEY='value' 行
 _singbox_parse_config() {
     if ! command -v python3 >/dev/null 2>&1; then
-        apt-get update -qq >/dev/null 2>&1
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null 2>&1
+        pkg_update >/dev/null 2>&1 || true
+        pkg_install python3 >/dev/null 2>&1
     fi
 
     python3 - "$SINGBOX_CONFIG" <<'PYEOF'
@@ -1496,8 +1662,8 @@ nft_install() {
         log_warn "nftables 已经安装, 跳过"
         return 0
     fi
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y nftables
+    pkg_update
+    pkg_install nftables
     systemctl enable nftables >/dev/null 2>&1 || true
     log_info "nftables 安装完成"
 }
@@ -1515,7 +1681,7 @@ nft_uninstall() {
     fi
     systemctl stop nftables 2>/dev/null || true
     systemctl disable nftables 2>/dev/null || true
-    DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y nftables
+    pkg_remove nftables
     log_info "nftables 已卸载"
 }
 
@@ -2325,8 +2491,8 @@ realm_install() {
     esac
 
     if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
-        apt-get update -qq >/dev/null
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl tar ca-certificates >/dev/null
+        pkg_update >/dev/null 2>&1 || true
+        pkg_install curl tar ca-certificates >/dev/null 2>&1
     fi
 
     log_info "获取最新版本 (zhboner/realm)..."
@@ -3104,8 +3270,10 @@ menu_main() {
     while true; do
         clear 2>/dev/null || printf "\n\n"
         printf "${BLUE}========================================================${NC}\n"
-        printf "${BLUE}      Debian/Ubuntu VPS 一键配置脚本 (主菜单)${NC}\n"
+        printf "${BLUE}      Linux VPS 一键配置脚本 (主菜单)${NC}\n"
         printf "${BLUE}========================================================${NC}\n"
+        printf "  系统: ${CYAN}%s${NC}  |  包管理: ${CYAN}%s${NC}\n" "${OS_PRETTY:-未知}" "${PKG_MGR:-未知}"
+        printf "${BLUE}--------------------------------------------------------${NC}\n"
         printf "  ${GREEN}1)${NC}  安装常用软件\n"
         printf "  ${GREEN}2)${NC}  配置 NTP ${MAGENTA}>${NC}\n"
         printf "  ${GREEN}3)${NC}  Fail2Ban ${MAGENTA}>${NC}\n"
@@ -3136,4 +3304,12 @@ menu_main() {
 
 # --- 入口 ---
 check_root
+detect_os
+if [ -z "$PKG_MGR" ]; then
+    log_error "未能识别系统的包管理器, 软件安装相关功能将不可用"
+    log_warn  "已识别系统: ${OS_PRETTY:-未知} (family=${OS_FAMILY:-unknown})"
+elif [ "$OS_FAMILY" = "unknown" ]; then
+    log_warn "未能识别发行版系族 (${OS_PRETTY:-未知}), 将基于包管理器 ($PKG_MGR) 尽力运行"
+fi
+resolve_chrony
 menu_main
