@@ -1,6 +1,6 @@
 # Linux VPS 一键配置脚本（多发行版自动识别）
 
-把原本散落的多个脚本（dd 重装 / fail2ban / nftables / sing-box / realm / BBR 调优）整合成一个交互式菜单脚本 **`setup.sh`**，全部 POSIX `sh`，支持 `curl | sh` 一键运行。
+把原本散落的多个脚本（dd 重装 / fail2ban / nftables / sing-box / realm / BBR 调优 / Cloudflare DDNS）整合成一个交互式菜单脚本 **`setup.sh`**，全部 POSIX `sh`，支持 `curl | sh` 一键运行。
 
 脚本启动时**自动识别发行版与包管理器**，安装/卸载逻辑统一走抽象层，无需手动适配：
 
@@ -37,7 +37,8 @@ sudo sh setup.sh
 5) 防火墙配置 >
 6) TCP 调优 >
 7) Realm 配置 >
-8) 系统重装 (DD) ⚠
+8) Cloudflare DDNS >
+9) 系统重装 (DD) ⚠
 q) 退出脚本
 ```
 
@@ -110,7 +111,16 @@ q) 退出脚本
 - 查看完整配置
 - **转发规则（增删改查）** — 直接编辑 TOML 配置，每次操作自动 `.bak.<timestamp>` 备份，修改后若服务在运行则自动 `systemctl restart`
 
-### 8) 系统重装（DD）
+### 8) Cloudflare DDNS
+状态栏显示：安装状态 / 域名 / Zone / 记录模式 / CF 代理 / TTL / 自动更新状态 / 最近日志。
+
+- **安装并配置**：输入域名 + API Token（Zone:DNS:Edit 权限），自动向上递归查找 Zone、缺失时自动创建占位 A/AAAA 记录
+- 记录模式支持 **仅 IPv4** 或 **IPv4 + IPv6 双栈**，可选 Cloudflare 代理（橙云）与自定义 TTL
+- 生成独立的 `/root/ddns.sh` 并写入 crontab（**每 5 分钟自动更新**，IP 未变化则跳过），日志自动截尾保留 500 行
+- 立即手动更新一次 / 查看日志（错误红色、成功绿色高亮）/ 暂停・恢复自动更新 / 卸载
+- cron 包名按发行版自动适配（Debian 系 `cron` / RHEL・Arch 系 `cronie` / Alpine `dcron`）
+
+### 9) 系统重装（DD）
 集成 [bin456789/reinstall](https://github.com/bin456789/reinstall)，覆盖以下系统：
 
 | 系统 | 版本 |
@@ -155,14 +165,18 @@ q) 退出脚本
 | `/usr/local/bin/bbr-optimize-apply.sh` | BBR 开机执行脚本 |
 | `/etc/realm/config.toml` 或 `/opt/realm/config.toml` | Realm 配置（Realm 模块的唯一数据源）|
 | `/etc/systemd/system/realm.service` | Realm systemd service（新装时创建）|
+| `/root/ddns.sh` | DDNS 更新脚本（crontab 每 5 分钟执行）|
+| `/root/.cf_token` | Cloudflare API Token（权限 600）|
+| `/root/.cf_zone` | DDNS 配置（域名 / Zone / 模式 / TTL）|
+| `/var/log/ddns.log` | DDNS 更新日志（自动截尾 500 行）|
 
 ## 依赖
 
 - 系统：基于 **systemd** 的主流发行版 —— Debian/Ubuntu、RHEL/CentOS/Rocky/AlmaLinux/Fedora、Arch、openSUSE 等（已识别 `apt`/`dnf`/`yum`/`pacman`/`apk`/`zypper`）
 - 必备工具：`curl`、`openssl`、`systemctl`、`awk`、`sed`
-- 按需自动安装：`chrony`、`fail2ban`、`nftables`、`realm`、`python3`、`tar`
+- 按需自动安装：`chrony`、`fail2ban`、`nftables`、`realm`、`python3`、`tar`、`cron`（DDNS 用，按发行版选 `cron`/`cronie`/`dcron`）
 
-`python3` 仅在 Sing-Box 查看链接时用于解析 `config.json`，脚本会按需调用对应包管理器安装。
+`python3` 在 Sing-Box 查看链接和 DDNS 解析 Cloudflare API 响应时使用，脚本会按需调用对应包管理器安装。
 
 > 备注：脚本逻辑面向 systemd 发行版。Alpine 等使用 OpenRC（非 systemd）的系统能完成软件安装，但 `systemctl` 相关的服务启停/状态功能可能不适用。
 

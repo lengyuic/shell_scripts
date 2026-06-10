@@ -38,6 +38,10 @@ CHRONY_CONF="/etc/chrony/chrony.conf"
 CHRONY_MARK_BEGIN="# === BEGIN setup.sh CUSTOM SOURCES ==="
 CHRONY_MARK_END="# === END setup.sh CUSTOM SOURCES ==="
 FAIL2BAN_JAILS_FILE="/etc/fail2ban_jails.conf"
+DDNS_SCRIPT="/root/ddns.sh"
+DDNS_TOKEN_FILE="/root/.cf_token"
+DDNS_ZONE_FILE="/root/.cf_zone"
+DDNS_LOG="/var/log/ddns.log"
 
 # ================================================================
 # 发行版检测 / 包管理抽象
@@ -2864,6 +2868,460 @@ realm_endpoint_modify() {
 }
 
 # ================================================================
+# Cloudflare DDNS 模块
+# ================================================================
+
+# 安装并启用 cron (多发行版: 包名/服务名各异)
+ddns_ensure_cron() {
+    if ! command -v crontab >/dev/null 2>&1; then
+        log_info "安装 cron..."
+        case "$PKG_MGR" in
+            dnf|yum|pacman) cron_pkg="cronie" ;;
+            apk)            cron_pkg="dcron"  ;;
+            *)              cron_pkg="cron"   ;;
+        esac
+        pkg_update
+        pkg_install "$cron_pkg" || return 1
+    fi
+    for _svc in cron crond cronie dcron; do
+        if systemctl list-unit-files 2>/dev/null | grep -q "^${_svc}\.service"; then
+            systemctl enable "$_svc" >/dev/null 2>&1 || true
+            systemctl start "$_svc" 2>/dev/null || true
+            break
+        fi
+    done
+}
+ddns_cfg_get() {
+    key="$1"
+    [ -f "$DDNS_ZONE_FILE" ] || return 1
+    grep "^${key}=" "$DDNS_ZONE_FILE" 2>/dev/null | head -n 1 | cut -d= -f2-
+}
+
+ddns_log_path() {
+    p=$(ddns_cfg_get LOG 2>/dev/null)
+    if [ -n "$p" ]; then
+        echo "$p"
+    else
+        echo "$DDNS_LOG"
+    fi
+}
+
+ddns_cron_enabled() {
+    command -v crontab >/dev/null 2>&1 || return 1
+    crontab -l 2>/dev/null | grep -q "ddns.sh"
+}
+
+ddns_status() {
+    printf "${MAGENTA}--- Cloudflare DDNS 状态 ---${NC}\n"
+    if [ ! -f "$DDNS_SCRIPT" ]; then
+        printf "  安装状态: ${RED}未安装${NC}\n"
+        printf "${MAGENTA}---------------------------${NC}\n"
+        return 0
+    fi
+    printf "  安装状态: ${GREEN}已安装${NC}\n"
+
+    if [ -f "$DDNS_ZONE_FILE" ]; then
+        d_domain=$(ddns_cfg_get DOMAIN)
+        d_zone=$(ddns_cfg_get ZONE)
+        d_mode=$(ddns_cfg_get MODE)
+        d_proxied=$(ddns_cfg_get PROXIED)
+        d_ttl=$(ddns_cfg_get TTL)
+        [ "$d_mode" = "dual" ] && mode_label="IPv4 + IPv6" || mode_label="仅 IPv4"
+        [ "$d_proxied" = "true" ] && proxy_label="开启" || proxy_label="关闭"
+        printf "  域名:     ${CYAN}%s${NC}\n" "$d_domain"
+        printf "  Zone:     ${CYAN}%s${NC}\n" "$d_zone"
+        printf "  记录模式: ${CYAN}%s${NC}\n" "$mode_label"
+        printf "  CF 代理:  ${CYAN}%s${NC}\n" "$proxy_label"
+        printf "  TTL:      ${CYAN}%s${NC}\n" "${d_ttl:-60}"
+    fi
+
+    if ddns_cron_enabled; then
+        printf "  自动更新: ${GREEN}已启用 (每5分钟)${NC}\n"
+    else
+        printf "  自动更新: ${YELLOW}未启用${NC}\n"
+    fi
+
+    log=$(ddns_log_path)
+    if [ -f "$log" ]; then
+        last=$(tail -n 1 "$log" 2>/dev/null)
+        [ -n "$last" ] && printf "  最近日志: ${CYAN}%s${NC}\n" "$last"
+    fi
+    printf "${MAGENTA}---------------------------${NC}\n"
+}
+
+# 由完整域名向上递归查找 Cloudflare zone, 输出 ZONE_NAME|ZONE_ID, 失败返回 1
+ddns_resolve_zone() {
+    domain="$1"
+    token="$2"
+    candidate="$domain"
+    while [ -n "$candidate" ]; do
+        case "$candidate" in
+            *.*) ;;
+            *) return 1 ;;
+        esac
+        resp=$(curl -s --max-time 10 \
+            "https://api.cloudflare.com/client/v4/zones?name=${candidate}" \
+            -H "Authorization: Bearer ${token}")
+        ok=$(printf '%s' "$resp" | python3 -c \
+            "import sys,json; print(json.load(sys.stdin).get('success', ''))" 2>/dev/null)
+        if [ "$ok" != "True" ]; then
+            return 2
+        fi
+        count=$(printf '%s' "$resp" | python3 -c \
+            "import sys,json; print(len(json.load(sys.stdin)['result']))" 2>/dev/null)
+        if [ -n "$count" ] && [ "$count" != "0" ]; then
+            zid=$(printf '%s' "$resp" | python3 -c \
+                "import sys,json; print(json.load(sys.stdin)['result'][0]['id'])" 2>/dev/null)
+            echo "${candidate}|${zid}"
+            return 0
+        fi
+        new_candidate=$(printf '%s' "$candidate" | cut -d. -f2-)
+        [ "$new_candidate" = "$candidate" ] && return 1
+        candidate="$new_candidate"
+    done
+    return 1
+}
+
+ddns_install() {
+    printf "${BLUE}=== 配置 Cloudflare DDNS ===${NC}\n"
+
+    # 依赖安装
+    need_pkgs=""
+    command -v curl    >/dev/null 2>&1 || need_pkgs="$need_pkgs curl"
+    command -v python3 >/dev/null 2>&1 || need_pkgs="$need_pkgs python3"
+    if [ -n "$need_pkgs" ]; then
+        log_info "安装依赖:$need_pkgs"
+        pkg_update
+        pkg_install $need_pkgs
+    fi
+    ddns_ensure_cron
+
+    read_input "请输入完整域名 (如 home.example.com)" "" DDNS_DOMAIN
+    if [ -z "$DDNS_DOMAIN" ]; then log_warn "已取消"; return 0; fi
+    case "$DDNS_DOMAIN" in
+        *.*) ;;
+        *) log_error "域名格式不合法: $DDNS_DOMAIN"; return 1 ;;
+    esac
+
+    read_input "请输入 Cloudflare API Token (Zone:DNS:Edit 权限)" "" DDNS_TOKEN
+    if [ -z "$DDNS_TOKEN" ]; then log_warn "已取消"; return 0; fi
+
+    read_input "记录模式 (1=仅IPv4, 2=IPv4+IPv6)" "1" DDNS_MODE_CH
+    case "$DDNS_MODE_CH" in
+        2) DDNS_MODE="dual" ;;
+        *) DDNS_MODE="ipv4" ;;
+    esac
+
+    read_input "是否启用 Cloudflare 代理(橙云)? (yes/no)" "no" DDNS_PROXY_CH
+    case "$DDNS_PROXY_CH" in
+        yes|y|Y|YES) DDNS_PROXIED="true" ;;
+        *)           DDNS_PROXIED="false" ;;
+    esac
+
+    read_input "TTL 秒数" "60" DDNS_TTL
+    case "$DDNS_TTL" in
+        ''|*[!0-9]*) DDNS_TTL="60" ;;
+    esac
+
+    log_info "向上递归查找 Cloudflare zone..."
+    zone_line=$(ddns_resolve_zone "$DDNS_DOMAIN" "$DDNS_TOKEN")
+    rc=$?
+    if [ "$rc" -eq 2 ]; then
+        log_error "Token 验证失败, 请检查 Token 权限"
+        return 1
+    fi
+    if [ "$rc" -ne 0 ] || [ -z "$zone_line" ]; then
+        log_error "找不到 ${DDNS_DOMAIN} 对应的 Cloudflare Zone, 请确认域名已托管"
+        return 1
+    fi
+    DDNS_ZONE_NAME=$(printf '%s' "$zone_line" | cut -d'|' -f1)
+    ZONE_ID=$(printf '%s' "$zone_line" | cut -d'|' -f2)
+    log_info "Zone: ${DDNS_ZONE_NAME}  (ID: ${ZONE_ID})"
+
+    printf "\n${CYAN}--- 配置确认 ---${NC}\n"
+    printf "  域名:    ${CYAN}%s${NC}\n" "$DDNS_DOMAIN"
+    printf "  Zone:    ${CYAN}%s${NC}\n" "$DDNS_ZONE_NAME"
+    [ "$DDNS_MODE" = "dual" ]    && pm="IPv4 + IPv6" || pm="仅 IPv4"
+    [ "$DDNS_PROXIED" = "true" ] && pp="开启"       || pp="关闭"
+    printf "  模式:    ${CYAN}%s${NC}\n" "$pm"
+    printf "  CF 代理: ${CYAN}%s${NC}\n" "$pp"
+    printf "  TTL:     ${CYAN}%s${NC}\n" "$DDNS_TTL"
+    read_input "确认安装? (yes/no)" "yes" CONFIRM
+    case "$CONFIRM" in
+        yes|y|Y|YES) ;;
+        *) log_warn "已取消"; return 0 ;;
+    esac
+
+    # A 记录: 不存在则创建占位
+    rec=$(curl -s --max-time 10 \
+        "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?name=${DDNS_DOMAIN}&type=A" \
+        -H "Authorization: Bearer ${DDNS_TOKEN}")
+    rec_count=$(printf '%s' "$rec" | python3 -c \
+        "import sys,json; print(len(json.load(sys.stdin)['result']))" 2>/dev/null)
+    if [ "$rec_count" = "0" ]; then
+        log_warn "未找到 A 记录, 自动创建占位..."
+        body=$(printf '{"type":"A","name":"%s","content":"1.1.1.1","ttl":%s,"proxied":%s}' \
+            "$DDNS_DOMAIN" "$DDNS_TTL" "$DDNS_PROXIED")
+        cr=$(curl -s -X POST --max-time 10 \
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
+            -H "Authorization: Bearer ${DDNS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$body")
+        ok=$(printf '%s' "$cr" | python3 -c \
+            "import sys,json; print(json.load(sys.stdin).get('success',''))" 2>/dev/null)
+        if [ "$ok" = "True" ]; then
+            log_info "A 记录已创建"
+        else
+            log_error "创建 A 记录失败"
+            return 1
+        fi
+    else
+        log_info "A 记录已存在"
+    fi
+
+    # AAAA 记录
+    if [ "$DDNS_MODE" = "dual" ]; then
+        rec=$(curl -s --max-time 10 \
+            "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?name=${DDNS_DOMAIN}&type=AAAA" \
+            -H "Authorization: Bearer ${DDNS_TOKEN}")
+        rec_count=$(printf '%s' "$rec" | python3 -c \
+            "import sys,json; print(len(json.load(sys.stdin)['result']))" 2>/dev/null)
+        if [ "$rec_count" = "0" ]; then
+            log_warn "未找到 AAAA 记录, 自动创建占位..."
+            body=$(printf '{"type":"AAAA","name":"%s","content":"::1","ttl":%s,"proxied":%s}' \
+                "$DDNS_DOMAIN" "$DDNS_TTL" "$DDNS_PROXIED")
+            cr=$(curl -s -X POST --max-time 10 \
+                "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" \
+                -H "Authorization: Bearer ${DDNS_TOKEN}" \
+                -H "Content-Type: application/json" \
+                --data "$body")
+            ok=$(printf '%s' "$cr" | python3 -c \
+                "import sys,json; print(json.load(sys.stdin).get('success',''))" 2>/dev/null)
+            if [ "$ok" = "True" ]; then
+                log_info "AAAA 记录已创建"
+            else
+                log_warn "AAAA 记录创建失败, 降级为仅 IPv4"
+                DDNS_MODE="ipv4"
+            fi
+        else
+            log_info "AAAA 记录已存在"
+        fi
+    fi
+
+    # 持久化配置
+    echo "$DDNS_TOKEN" > "$DDNS_TOKEN_FILE"
+    chmod 600 "$DDNS_TOKEN_FILE"
+    touch "$DDNS_LOG" 2>/dev/null || true
+    chmod 644 "$DDNS_LOG" 2>/dev/null || true
+
+    {
+        echo "DOMAIN=${DDNS_DOMAIN}"
+        echo "ZONE=${DDNS_ZONE_NAME}"
+        echo "MODE=${DDNS_MODE}"
+        echo "PROXIED=${DDNS_PROXIED}"
+        echo "TTL=${DDNS_TTL}"
+        echo "LOG=${DDNS_LOG}"
+    } > "$DDNS_ZONE_FILE"
+
+    # 写入执行脚本
+    cat > "$DDNS_SCRIPT" <<'DDNS_INNER'
+#!/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+DOMAIN="__DOMAIN__"
+ZONE="__ZONE__"
+MODE="__MODE__"
+PROXIED="__PROXIED__"
+TTL="__TTL__"
+TOKEN_FILE="/root/.cf_token"
+LOG_FILE="/var/log/ddns.log"
+
+API_TOKEN=$(cat "$TOKEN_FILE" 2>/dev/null)
+[ -z "$API_TOKEN" ] && exit 1
+
+# 日志轮转 (>500 行截尾)
+if [ -f "$LOG_FILE" ]; then
+    LOG_LINES=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$LOG_LINES" -gt 500 ]; then
+        tail -n 500 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+    fi
+fi
+
+CURRENT_IP4=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null \
+    || curl -4 -s --max-time 5 https://ifconfig.me/ip 2>/dev/null \
+    || curl -4 -s --max-time 5 https://ip.sb 2>/dev/null)
+CURRENT_IP4=$(printf '%s' "$CURRENT_IP4" | tr -d '\r\n ')
+
+CURRENT_IP6=""
+if [ "$MODE" = "dual" ]; then
+    CURRENT_IP6=$(curl -6 -s --max-time 5 https://api64.ipify.org 2>/dev/null \
+        || curl -6 -s --max-time 5 https://ipv6.icanhazip.com 2>/dev/null)
+    CURRENT_IP6=$(printf '%s' "$CURRENT_IP6" | tr -d '\r\n ')
+fi
+
+if [ -z "$CURRENT_IP4" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: 无法获取公网 IPv4" >> "$LOG_FILE"
+    exit 1
+fi
+if ! echo "$CURRENT_IP4" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: 获取到的 IP 非法 ${CURRENT_IP4}" >> "$LOG_FILE"
+    exit 1
+fi
+
+ZONE_ID=$(curl -s --max-time 8 "https://api.cloudflare.com/client/v4/zones?name=${ZONE}" \
+    -H "Authorization: Bearer ${API_TOKEN}" | \
+    python3 -c "import sys,json; print(json.load(sys.stdin)['result'][0]['id'])" 2>/dev/null)
+if [ -z "$ZONE_ID" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: 获取 Zone ID 失败" >> "$LOG_FILE"
+    exit 1
+fi
+
+update_record() {
+    TYPE="$1"
+    NEW_IP="$2"
+    [ -z "$NEW_IP" ] && return 0
+    RECORD_ID=$(curl -s --max-time 8 \
+        "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?name=${DOMAIN}&type=${TYPE}" \
+        -H "Authorization: Bearer ${API_TOKEN}" | \
+        python3 -c "import sys,json; print(json.load(sys.stdin)['result'][0]['id'])" 2>/dev/null)
+    if [ -z "$RECORD_ID" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: ${TYPE} 记录不存在" >> "$LOG_FILE"
+        return 1
+    fi
+    OLD_IP=$(curl -s --max-time 8 \
+        "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${RECORD_ID}" \
+        -H "Authorization: Bearer ${API_TOKEN}" | \
+        python3 -c "import sys,json; print(json.load(sys.stdin)['result']['content'])" 2>/dev/null)
+    if [ -z "$OLD_IP" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: ${TYPE} 无法获取当前记录值, 跳过" >> "$LOG_FILE"
+        return 0
+    fi
+    if [ "$NEW_IP" = "$OLD_IP" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] OK: ${TYPE} 未变化 ${NEW_IP}" >> "$LOG_FILE"
+        return 0
+    fi
+    JSON_BODY=$(printf '{"type":"%s","name":"%s","content":"%s","ttl":%s,"proxied":%s}' \
+        "$TYPE" "$DOMAIN" "$NEW_IP" "$TTL" "$PROXIED")
+    RESULT=$(curl -s -X PUT --max-time 10 \
+        "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records/${RECORD_ID}" \
+        -H "Authorization: Bearer ${API_TOKEN}" \
+        -H "Content-Type: application/json" \
+        --data "$JSON_BODY")
+    SUCCESS=$(echo "$RESULT" | python3 -c \
+        "import sys,json; print(json.load(sys.stdin).get('success'))" 2>/dev/null)
+    if [ "$SUCCESS" = "True" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] OK: ${TYPE} 更新成功 ${OLD_IP} -> ${NEW_IP}" >> "$LOG_FILE"
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: ${TYPE} 更新失败 $RESULT" >> "$LOG_FILE"
+        return 1
+    fi
+}
+
+update_record A "$CURRENT_IP4"
+if [ "$MODE" = "dual" ] && [ -n "$CURRENT_IP6" ]; then
+    update_record AAAA "$CURRENT_IP6"
+fi
+DDNS_INNER
+
+    sed -i "s|__DOMAIN__|${DDNS_DOMAIN}|g"      "$DDNS_SCRIPT"
+    sed -i "s|__ZONE__|${DDNS_ZONE_NAME}|g"     "$DDNS_SCRIPT"
+    sed -i "s|__MODE__|${DDNS_MODE}|g"          "$DDNS_SCRIPT"
+    sed -i "s|__PROXIED__|${DDNS_PROXIED}|g"    "$DDNS_SCRIPT"
+    sed -i "s|__TTL__|${DDNS_TTL}|g"            "$DDNS_SCRIPT"
+    chmod 700 "$DDNS_SCRIPT"
+
+    cron_job="*/5 * * * * ${DDNS_SCRIPT} >> ${DDNS_LOG} 2>&1"
+    ( crontab -l 2>/dev/null | grep -v "ddns.sh"; echo "$cron_job" ) | crontab -
+    log_info "crontab 已设置 (每5分钟自动更新)"
+
+    log_info "立即执行一次测试..."
+    if sh "$DDNS_SCRIPT"; then
+        tail -n 1 "$DDNS_LOG" 2>/dev/null | while IFS= read -r l; do
+            printf "  ${GREEN}%s${NC}\n" "$l"
+        done
+    else
+        log_error "测试执行失败, 请查看日志: $DDNS_LOG"
+    fi
+    log_info "DDNS 配置完成: $DDNS_DOMAIN"
+}
+
+ddns_run_now() {
+    if [ ! -f "$DDNS_SCRIPT" ]; then
+        log_error "DDNS 未安装"
+        return 1
+    fi
+    log_info "正在手动更新..."
+    if sh "$DDNS_SCRIPT"; then
+        log=$(ddns_log_path)
+        tail -n 1 "$log" 2>/dev/null | while IFS= read -r l; do
+            printf "  ${GREEN}%s${NC}\n" "$l"
+        done
+    else
+        log_error "更新失败, 请查看日志"
+    fi
+}
+
+ddns_view_logs() {
+    log=$(ddns_log_path)
+    if [ ! -f "$log" ]; then
+        log_warn "日志文件不存在: $log"
+        return 0
+    fi
+    printf "${CYAN}--- %s (尾部 30 行) ---${NC}\n" "$log"
+    tail -n 30 "$log" | while IFS= read -r line; do
+        case "$line" in
+            *ERROR*)    printf "  ${RED}%s${NC}\n" "$line" ;;
+            *"更新成功"*) printf "  ${GREEN}%s${NC}\n" "$line" ;;
+            *)          printf "  %s\n" "$line" ;;
+        esac
+    done
+}
+
+ddns_pause() {
+    if [ ! -f "$DDNS_SCRIPT" ]; then
+        log_error "DDNS 未安装"
+        return 1
+    fi
+    if ! command -v crontab >/dev/null 2>&1; then
+        log_warn "未安装 cron"
+        return 0
+    fi
+    ( crontab -l 2>/dev/null | grep -v "ddns.sh" ) | crontab - 2>/dev/null
+    log_info "DDNS 自动更新已暂停"
+}
+
+ddns_resume() {
+    if [ ! -f "$DDNS_SCRIPT" ]; then
+        log_error "DDNS 未安装"
+        return 1
+    fi
+    ddns_ensure_cron
+    log=$(ddns_log_path)
+    cron_job="*/5 * * * * ${DDNS_SCRIPT} >> ${log} 2>&1"
+    ( crontab -l 2>/dev/null | grep -v "ddns.sh"; echo "$cron_job" ) | crontab -
+    log_info "DDNS 自动更新已恢复 (每5分钟)"
+}
+
+ddns_uninstall() {
+    printf "${BLUE}=== 卸载 DDNS ===${NC}\n"
+    if [ ! -f "$DDNS_SCRIPT" ] && [ ! -f "$DDNS_TOKEN_FILE" ] && [ ! -f "$DDNS_ZONE_FILE" ]; then
+        log_warn "DDNS 未安装, 无需卸载"
+        return 0
+    fi
+    read_input "确认卸载 DDNS? 将移除 cron / 脚本 / Token (yes/no)" "no" CONFIRM
+    if [ "$CONFIRM" != "yes" ]; then
+        log_warn "已取消"
+        return 0
+    fi
+    if command -v crontab >/dev/null 2>&1; then
+        ( crontab -l 2>/dev/null | grep -v "ddns.sh" ) | crontab - 2>/dev/null
+    fi
+    rm -f "$DDNS_SCRIPT" "$DDNS_TOKEN_FILE" "$DDNS_ZONE_FILE"
+    log_info "DDNS 已卸载 (日志文件保留: $DDNS_LOG)"
+}
+
+
+# ================================================================
 # 系统重装 (reinstall.sh) 任务
 # ================================================================
 task_system_reinstall() {
@@ -3242,6 +3700,50 @@ menu_realm() {
 }
 
 # ================================================================
+# 子菜单: Cloudflare DDNS
+# ================================================================
+menu_ddns() {
+    while true; do
+        printf "\n${BLUE}========== Cloudflare DDNS ==========${NC}\n"
+        ddns_status
+        if [ ! -f "$DDNS_SCRIPT" ]; then
+            printf "  ${GREEN}1)${NC}  安装并配置 DDNS\n"
+        else
+            printf "  ${GREEN}1)${NC}  重新配置 DDNS\n"
+            printf "  ${GREEN}2)${NC}  立即手动更新一次\n"
+            printf "  ${GREEN}3)${NC}  查看日志\n"
+            if ddns_cron_enabled; then
+                printf "  ${YELLOW}4)${NC}  暂停自动更新\n"
+            else
+                printf "  ${GREEN}4)${NC}  恢复自动更新\n"
+            fi
+            printf "  ${YELLOW}5)${NC}  卸载 DDNS\n"
+        fi
+        print_submenu_footer
+        prompt_choice
+
+        case "$choice" in
+            1)    ddns_install; press_to_continue ;;
+            2)    ddns_run_now; press_to_continue ;;
+            3)    ddns_view_logs; press_to_continue ;;
+            4)
+                if ddns_cron_enabled; then
+                    ddns_pause
+                else
+                    ddns_resume
+                fi
+                press_to_continue
+                ;;
+            5)    ddns_uninstall; press_to_continue ;;
+            '')   return 0 ;;
+            m|M)  return 99 ;;
+            q|Q)  exit 0 ;;
+            *)    log_warn "无效选项: $choice"; press_to_continue ;;
+        esac
+    done
+}
+
+# ================================================================
 # 子菜单: TCP 调优
 # ================================================================
 menu_tcp_tune() {
@@ -3281,7 +3783,8 @@ menu_main() {
         printf "  ${GREEN}5)${NC}  防火墙配置 ${MAGENTA}>${NC}\n"
         printf "  ${GREEN}6)${NC}  TCP 调优 ${MAGENTA}>${NC}\n"
         printf "  ${GREEN}7)${NC}  Realm 配置 ${MAGENTA}>${NC}\n"
-        printf "  ${RED}8)${NC}  系统重装 (DD) ${RED}⚠${NC}\n"
+        printf "  ${GREEN}8)${NC}  Cloudflare DDNS ${MAGENTA}>${NC}\n"
+        printf "  ${RED}9)${NC}  系统重装 (DD) ${RED}⚠${NC}\n"
         printf "  ${RED}q)${NC}  退出脚本\n"
         printf "${BLUE}========================================================${NC}\n"
         prompt_choice "请输入选项: "
@@ -3294,7 +3797,8 @@ menu_main() {
             5)    menu_firewall ;;
             6)    menu_tcp_tune ;;
             7)    menu_realm ;;
-            8)    task_system_reinstall; press_to_continue ;;
+            8)    menu_ddns ;;
+            9)    task_system_reinstall; press_to_continue ;;
             q|Q)  printf "${GREEN}再见!${NC}\n"; exit 0 ;;
             ''|m|M) ;;
             *)    log_warn "无效选项: $choice"; press_to_continue ;;
