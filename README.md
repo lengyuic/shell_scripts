@@ -38,7 +38,8 @@ sudo sh setup.sh
 6) TCP 调优 >
 7) Realm 配置 >
 8) Cloudflare DDNS >
-9) 系统重装 (DD) ⚠
+9) SSH 配置 >
+10) 系统重装 (DD) ⚠
 q) 退出脚本
 ```
 
@@ -120,7 +121,16 @@ q) 退出脚本
 - 立即手动更新一次 / 查看日志（错误红色、成功绿色高亮）/ 暂停・恢复自动更新 / 卸载
 - cron 包名按发行版自动适配（Debian 系 `cron` / RHEL・Arch 系 `cronie` / Alpine `dcron`）
 
-### 9) 系统重装（DD）
+### 9) SSH 配置
+状态栏显示：端口 / 密码登录 / 密钥登录 / Root 登录 / 已授权密钥数 / 配置方式（drop-in 或主配置）。
+
+- **密钥配置（三级菜单）**：列出 `/root/.ssh/authorized_keys` 中的密钥（类型 + 指纹 + 注释）；支持**粘贴添加公钥**（格式 + `ssh-keygen` 双重校验、自动去重）、**服务器生成 ed25519 密钥对**（公钥自动入库，私钥屏显一次，可选删除服务器留存）、**按序号删除**
+- **端口配置**：校验范围与端口占用，`sshd -t` 校验失败自动回滚；改完提示保留当前会话验证、放行安全组、Fail2Ban 重新应用
+- **密码登录开关**：按当前状态显示"关闭/开启密码登录"；关闭前强制要求 authorized_keys 至少有一把密钥，需输入 `yes` 确认；自动兼容新旧 OpenSSH（`KbdInteractiveAuthentication` / `ChallengeResponseAuthentication`）
+- 配置写入自动适配：存在 `Include sshd_config.d` 时写入 `00-setup-script.conf` drop-in（优先级最高），否则直接改 `sshd_config`；每次修改前自动备份，校验失败回滚
+- 安全兜底：密码登录已关闭时禁止删除最后一把密钥
+
+### 10) 系统重装（DD）
 集成 [bin456789/reinstall](https://github.com/bin456789/reinstall)，覆盖以下系统：
 
 | 系统 | 版本 |
@@ -169,6 +179,8 @@ q) 退出脚本
 | `/root/.cf_token` | Cloudflare API Token（权限 600）|
 | `/root/.cf_zone` | DDNS 配置（域名 / Zone / 模式 / TTL）|
 | `/var/log/ddns.log` | DDNS 更新日志（自动截尾 500 行）|
+| `/etc/ssh/sshd_config.d/00-setup-script.conf` | SSH 模块写入的 drop-in 配置（系统支持 Include 时）|
+| `/root/.ssh/authorized_keys` | SSH 授权公钥（密钥配置的唯一数据源）|
 
 ## 依赖
 

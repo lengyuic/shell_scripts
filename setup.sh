@@ -10,7 +10,12 @@
 #   3. Fail2Ban        (子菜单)
 #   4. Sing-Box 配置   (子菜单)
 #   5. 防火墙配置      (子菜单)
-#   00. 退出
+#   6. TCP 调优        (子菜单)
+#   7. Realm 配置      (子菜单)
+#   8. Cloudflare DDNS (子菜单)
+#   9. SSH 配置        (子菜单: 密钥/端口/密码登录)
+#   10. 系统重装 (DD)
+#   q. 退出
 # 用法: sudo sh setup.sh
 # ================================================================
 
@@ -42,6 +47,10 @@ DDNS_SCRIPT="/root/ddns.sh"
 DDNS_TOKEN_FILE="/root/.cf_token"
 DDNS_ZONE_FILE="/root/.cf_zone"
 DDNS_LOG="/var/log/ddns.log"
+SSHD_CONFIG="/etc/ssh/sshd_config"
+SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
+SSHD_DROPIN="/etc/ssh/sshd_config.d/00-setup-script.conf"
+AUTH_KEYS_FILE="/root/.ssh/authorized_keys"
 
 # ================================================================
 # 发行版检测 / 包管理抽象
@@ -3484,6 +3493,364 @@ task_system_reinstall() {
 }
 
 # ================================================================
+# 主菜单任务 9: SSH 配置 (密钥 / 端口 / 密码登录)
+# ================================================================
+
+# 是否采用 drop-in 目录方式管理配置 (Ubuntu/Debian 新版)
+ssh_use_dropin() {
+    [ -d "$SSHD_DROPIN_DIR" ] || return 1
+    grep -iq '^[[:space:]]*include[[:space:]].*sshd_config\.d' "$SSHD_CONFIG" 2>/dev/null
+}
+
+# 在指定文件中设置配置项: 替换首个同名指令 (含大小写不同), 删除重复项, 无则追加
+_ssh_set_in_file() {
+    _f="$1"; _k="$2"; _v="$3"
+    _tmp="${_f}.tmp.$$"
+    awk -v key="$_k" -v val="$_v" '
+        BEGIN { lk = tolower(key); done = 0 }
+        {
+            line = $0
+            sub(/^[ \t]+/, "", line)
+            n = split(line, a, /[ \t]+/)
+            if (n > 0 && tolower(a[1]) == lk) {
+                if (!done) { print key " " val; done = 1 }
+                next
+            }
+            print
+        }
+        END { if (!done) print key " " val }
+    ' "$_f" > "$_tmp" && cat "$_tmp" > "$_f" && rm -f "$_tmp"
+}
+
+# 在指定文件中注释掉某个配置项的所有生效行
+_ssh_comment_in_file() {
+    _f="$1"; _k="$2"
+    [ -f "$_f" ] || return 0
+    _tmp="${_f}.tmp.$$"
+    awk -v key="$_k" '
+        BEGIN { lk = tolower(key) }
+        {
+            line = $0
+            sub(/^[ \t]+/, "", line)
+            n = split(line, a, /[ \t]+/)
+            if (n > 0 && tolower(a[1]) == lk) { print "#" $0; next }
+            print
+        }
+    ' "$_f" > "$_tmp" && cat "$_tmp" > "$_f" && rm -f "$_tmp"
+}
+
+# 设置 sshd 配置项 (优先写入 drop-in, 保证优先级最高)
+ssh_config_set() {
+    _key="$1"; _val="$2"
+    if ssh_use_dropin; then
+        [ -f "$SSHD_DROPIN" ] || printf '# 由 setup.sh 生成, 优先级最高 (00- 前缀)\n' > "$SSHD_DROPIN"
+        _ssh_set_in_file "$SSHD_DROPIN" "$_key" "$_val"
+        # Port 为累加型指令 (多条 = 监听多个端口), 需注释掉主配置中的旧值
+        if [ "$_key" = "Port" ]; then
+            _ssh_comment_in_file "$SSHD_CONFIG" "Port"
+        fi
+    else
+        _ssh_set_in_file "$SSHD_CONFIG" "$_key" "$_val"
+    fi
+}
+
+# 备份 / 恢复 sshd 配置 (校验失败时回滚)
+ssh_backup_config() {
+    cp -p "$SSHD_CONFIG" "${SSHD_CONFIG}.setup-bak" 2>/dev/null
+    [ -f "$SSHD_DROPIN" ] && cp -p "$SSHD_DROPIN" "${SSHD_DROPIN}.setup-bak"
+    return 0
+}
+
+ssh_restore_config() {
+    [ -f "${SSHD_CONFIG}.setup-bak" ] && cat "${SSHD_CONFIG}.setup-bak" > "$SSHD_CONFIG"
+    if [ -f "${SSHD_DROPIN}.setup-bak" ]; then
+        cat "${SSHD_DROPIN}.setup-bak" > "$SSHD_DROPIN"
+    elif [ -f "$SSHD_DROPIN" ]; then
+        rm -f "$SSHD_DROPIN"
+    fi
+    return 0
+}
+
+# 重启 sshd (兼容 systemd socket 激活 / OpenRC / SysV)
+ssh_restart_service() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload 2>/dev/null || true
+        if systemctl is-active ssh.socket >/dev/null 2>&1; then
+            systemctl restart ssh.socket 2>/dev/null || true
+        fi
+        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service sshd restart >/dev/null 2>&1
+    else
+        service sshd restart >/dev/null 2>&1 || service ssh restart >/dev/null 2>&1
+    fi
+}
+
+# 校验配置并重启, 失败自动回滚 (返回 1)
+ssh_validate_and_restart() {
+    err=$(sshd -t 2>&1)
+    if [ -n "$err" ]; then
+        log_error "sshd 配置校验失败, 已回滚:"
+        printf '%s\n' "$err"
+        ssh_restore_config
+        return 1
+    fi
+    ssh_restart_service
+    log_info "sshd 已重启生效"
+    return 0
+}
+
+# 读取 sshd 生效配置值 (sshd -T 输出为全小写键名)
+ssh_effective() {
+    sshd -T 2>/dev/null | awk -v k="$1" '$1 == k { print $2; exit }'
+}
+
+# 密码登录当前是否开启
+ssh_password_enabled() {
+    v=$(ssh_effective passwordauthentication)
+    [ "$v" != "no" ]
+}
+
+# 统计 authorized_keys 中的有效密钥数
+ssh_key_count() {
+    [ -f "$AUTH_KEYS_FILE" ] || { echo 0; return; }
+    _cnt=$(grep -c -E '^[[:space:]]*(ssh-|ecdsa-|sk-)' "$AUTH_KEYS_FILE" 2>/dev/null)
+    echo "${_cnt:-0}"
+}
+
+# 确保 /root/.ssh 与 authorized_keys 存在且权限正确
+ssh_ensure_authkeys() {
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+    touch "$AUTH_KEYS_FILE"
+    chmod 600 "$AUTH_KEYS_FILE"
+}
+
+ssh_status() {
+    printf "${MAGENTA}--- SSH 状态 ---${NC}\n"
+    if [ ! -f "$SSHD_CONFIG" ]; then
+        printf "  ${RED}未找到 %s (openssh-server 未安装?)${NC}\n" "$SSHD_CONFIG"
+        printf "${MAGENTA}----------------${NC}\n"
+        return 0
+    fi
+    ports=$(sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }' | tr '\n' ' ')
+    [ -z "$ports" ] && ports="$(get_ssh_port) "
+    pw=$(ssh_effective passwordauthentication)
+    pk=$(ssh_effective pubkeyauthentication)
+    rl=$(ssh_effective permitrootlogin)
+    printf "  端口:       ${CYAN}%s${NC}\n" "$ports"
+    if [ "$pw" = "no" ]; then
+        printf "  密码登录:   ${GREEN}已关闭${NC}\n"
+    else
+        printf "  密码登录:   ${YELLOW}开启${NC}\n"
+    fi
+    if [ "$pk" = "no" ]; then
+        printf "  密钥登录:   ${RED}已关闭${NC}\n"
+    else
+        printf "  密钥登录:   ${GREEN}开启${NC}\n"
+    fi
+    printf "  Root 登录:  ${CYAN}%s${NC}\n" "${rl:-未知}"
+    printf "  已授权密钥: ${CYAN}%s 个${NC}\n" "$(ssh_key_count)"
+    if ssh_use_dropin; then
+        printf "  配置方式:   ${CYAN}drop-in (%s)${NC}\n" "$SSHD_DROPIN"
+    else
+        printf "  配置方式:   ${CYAN}%s${NC}\n" "$SSHD_CONFIG"
+    fi
+    printf "${MAGENTA}----------------${NC}\n"
+}
+
+# --- 密钥配置 ---
+ssh_keys_view() {
+    printf "${MAGENTA}--- 已授权密钥 (%s) ---${NC}\n" "$AUTH_KEYS_FILE"
+    if [ ! -s "$AUTH_KEYS_FILE" ]; then
+        printf "  ${YELLOW}(暂无密钥)${NC}\n"
+        return 0
+    fi
+    i=0
+    while IFS= read -r line; do
+        case "$line" in ''|\#*) continue ;; esac
+        i=$((i + 1))
+        ktype=$(printf '%s' "$line" | awk '{print $1}')
+        kcomment=$(printf '%s' "$line" | awk '{ if (NF >= 3) { s = $3; for (j = 4; j <= NF; j++) s = s " " $j; print s } else print "-" }')
+        fp=$(printf '%s\n' "$line" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')
+        if [ -z "$fp" ]; then
+            body=$(printf '%s' "$line" | awk '{print $2}')
+            fp=$(printf '%s' "$body" | cut -c1-16)"..."
+        fi
+        printf "  ${GREEN}%d)${NC} %-12s %s  ${CYAN}%s${NC}\n" "$i" "$ktype" "$fp" "$kcomment"
+    done < "$AUTH_KEYS_FILE"
+    [ "$i" -eq 0 ] && printf "  ${YELLOW}(暂无密钥)${NC}\n"
+    return 0
+}
+
+ssh_key_add() {
+    printf "${CYAN}请粘贴公钥 (一整行, 以 ssh-ed25519 / ssh-rsa / ecdsa- 等开头, 回车取消):${NC}\n"
+    read_tty pubkey
+    [ -z "$pubkey" ] && return 1
+    case "$pubkey" in
+        ssh-ed25519\ *|ssh-rsa\ *|ssh-dss\ *|ecdsa-sha2-*\ *|sk-ssh-*\ *|sk-ecdsa-*\ *) ;;
+        *) log_error "格式不正确: 应为 \"<类型> <base64密钥> [注释]\""; return 1 ;;
+    esac
+    if command -v ssh-keygen >/dev/null 2>&1; then
+        if ! printf '%s\n' "$pubkey" | ssh-keygen -lf - >/dev/null 2>&1; then
+            log_error "公钥内容无效 (ssh-keygen 校验失败)"
+            return 1
+        fi
+    fi
+    ssh_ensure_authkeys
+    keybody=$(printf '%s' "$pubkey" | awk '{print $2}')
+    if grep -qF -- "$keybody" "$AUTH_KEYS_FILE"; then
+        log_warn "该公钥已存在, 跳过"
+        return 1
+    fi
+    printf '%s\n' "$pubkey" >> "$AUTH_KEYS_FILE"
+    log_info "公钥已添加"
+    return 1
+}
+
+ssh_key_generate() {
+    if ! command -v ssh-keygen >/dev/null 2>&1; then
+        log_error "未找到 ssh-keygen, 请先安装 openssh"
+        return 0
+    fi
+    ssh_ensure_authkeys
+    ts=$(date +%Y%m%d%H%M%S)
+    keyfile="/root/.ssh/setup_ed25519_$ts"
+    comment="setup-$(hostname 2>/dev/null || echo vps)-$(date +%Y%m%d)"
+    if ! ssh-keygen -t ed25519 -f "$keyfile" -N "" -C "$comment" >/dev/null 2>&1; then
+        log_error "密钥生成失败"
+        return 0
+    fi
+    cat "${keyfile}.pub" >> "$AUTH_KEYS_FILE"
+    log_info "已生成 ed25519 密钥对, 公钥已加入 authorized_keys"
+    printf "\n${YELLOW}===== 请立即复制并妥善保存以下私钥 (仅显示这一次机会) =====${NC}\n"
+    cat "$keyfile"
+    printf "${YELLOW}============================================================${NC}\n"
+    printf "本地保存为 ~/.ssh/id_ed25519_vps 并执行: ${CYAN}chmod 600 ~/.ssh/id_ed25519_vps${NC}\n"
+    printf "登录命令: ${CYAN}ssh -i ~/.ssh/id_ed25519_vps -p %s root@服务器IP${NC}\n" "$(get_ssh_port)"
+    read_input "是否从服务器删除私钥文件 (保存好后建议删除)? (y/N)" "N" del_key
+    case "$del_key" in
+        y|Y)
+            rm -f "$keyfile"
+            log_info "服务器上的私钥文件已删除"
+            ;;
+        *)
+            log_warn "私钥保留在: $keyfile"
+            ;;
+    esac
+}
+
+ssh_key_delete() {
+    n=$(ssh_key_count)
+    if [ "$n" -eq 0 ]; then
+        log_warn "没有可删除的密钥"
+        return 1
+    fi
+    read_input "请输入要删除的密钥序号 (回车取消)" "" idx
+    [ -z "$idx" ] && return 1
+    case "$idx" in
+        *[!0-9]*) log_error "无效序号: $idx"; return 1 ;;
+    esac
+    if [ "$idx" -lt 1 ] || [ "$idx" -gt "$n" ]; then
+        log_error "序号超出范围 (1-$n)"
+        return 1
+    fi
+    if [ "$n" -eq 1 ] && ! ssh_password_enabled; then
+        log_error "密码登录已关闭, 禁止删除最后一把密钥 (会导致无法登录)"
+        log_warn  "请先开启密码登录或添加新密钥"
+        return 1
+    fi
+    _tmp="${AUTH_KEYS_FILE}.tmp.$$"
+    awk -v n="$idx" '
+        /^[ \t]*(#|$)/ { print; next }
+        { i++; if (i != n) print }
+    ' "$AUTH_KEYS_FILE" > "$_tmp" && cat "$_tmp" > "$AUTH_KEYS_FILE" && rm -f "$_tmp"
+    log_info "密钥 #$idx 已删除"
+    return 1
+}
+
+# --- 端口配置 ---
+ssh_port_config() {
+    cur_port=$(get_ssh_port)
+    printf "${BLUE}=== SSH 端口配置 ===${NC}\n"
+    printf "当前端口: ${CYAN}%s${NC}\n" "$cur_port"
+    read_input "请输入新的 SSH 端口 (1-65535)" "$cur_port" new_port
+    case "$new_port" in
+        *[!0-9]*|'') log_error "无效端口: $new_port"; return 0 ;;
+    esac
+    if [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+        log_error "端口超出范围: $new_port"
+        return 0
+    fi
+    if [ "$new_port" = "$cur_port" ]; then
+        log_warn "端口未变化, 无需修改"
+        return 0
+    fi
+    if command -v ss >/dev/null 2>&1; then
+        if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${new_port}$"; then
+            log_error "端口 $new_port 已被其他进程占用"
+            return 0
+        fi
+    fi
+    read_input "确认将 SSH 端口改为 $new_port? (y/N)" "N" confirm
+    case "$confirm" in y|Y) ;; *) log_warn "已取消"; return 0 ;; esac
+
+    ssh_backup_config
+    ssh_config_set Port "$new_port"
+    ssh_validate_and_restart || return 0
+
+    printf "\n"
+    log_info "SSH 端口已修改为: $new_port"
+    log_warn "请保持当前会话不要断开, 另开终端验证: ssh -p $new_port root@服务器IP"
+    log_warn "如使用云服务器, 请在安全组中放行 TCP $new_port"
+    if [ -f "$FAIL2BAN_JAILS_FILE" ] && command -v fail2ban-client >/dev/null 2>&1; then
+        log_warn "检测到 Fail2Ban, 建议进入 [Fail2Ban 菜单] 重新应用配置以跟随新端口"
+    fi
+}
+
+# --- 密码登录开关 ---
+ssh_password_disable() {
+    n=$(ssh_key_count)
+    if [ "$n" -eq 0 ]; then
+        log_error "authorized_keys 中没有任何密钥, 禁止关闭密码登录 (会导致无法登录)"
+        log_warn  "请先在 [密钥配置] 中添加公钥并验证密钥可登录"
+        return 0
+    fi
+    printf "${YELLOW}关闭后仅能通过密钥登录, 请确认已用密钥成功登录过本机!${NC}\n"
+    read_input "确认关闭密码登录? 输入 yes 继续" "" confirm
+    if [ "$confirm" != "yes" ]; then
+        log_warn "已取消"
+        return 0
+    fi
+    ssh_backup_config
+    ssh_config_set PubkeyAuthentication yes
+    ssh_config_set PasswordAuthentication no
+    # 新版 OpenSSH 用 KbdInteractiveAuthentication, 旧版 (如 CentOS 7) 只认 ChallengeResponseAuthentication
+    if sshd -T 2>/dev/null | grep -q '^kbdinteractiveauthentication'; then
+        ssh_config_set KbdInteractiveAuthentication no
+    else
+        ssh_config_set ChallengeResponseAuthentication no
+    fi
+    ssh_validate_and_restart || return 0
+    log_info "密码登录已关闭, 仅允许密钥登录"
+    log_warn "请保持当前会话不要断开, 另开终端验证密钥登录正常"
+}
+
+ssh_password_enable() {
+    read_input "确认重新开启密码登录? (y/N)" "N" confirm
+    case "$confirm" in y|Y) ;; *) log_warn "已取消"; return 0 ;; esac
+    ssh_backup_config
+    ssh_config_set PasswordAuthentication yes
+    if sshd -T 2>/dev/null | grep -q '^kbdinteractiveauthentication'; then
+        ssh_config_set KbdInteractiveAuthentication yes
+    else
+        ssh_config_set ChallengeResponseAuthentication yes
+    fi
+    ssh_validate_and_restart || return 0
+    log_info "密码登录已开启"
+}
+
+# ================================================================
 # 子菜单: NTP 服务器 (增删改查)
 # ================================================================
 menu_ntp_servers() {
@@ -3768,6 +4135,67 @@ menu_tcp_tune() {
     done
 }
 
+# ================================================================
+# 子菜单: SSH 配置
+# ================================================================
+menu_ssh_keys() {
+    while true; do
+        printf "\n"
+        ssh_keys_view
+        printf "${BLUE}---------------- 操作 ----------------${NC}\n"
+        printf "  ${GREEN}1)${NC} 粘贴添加公钥    ${GREEN}2)${NC} 生成新密钥对    ${GREEN}3)${NC} 删除公钥\n"
+        print_submenu_footer
+        prompt_choice
+        case "$choice" in
+            1)   ssh_key_add; press_to_continue ;;
+            2)   ssh_key_generate; press_to_continue ;;
+            3)   ssh_key_delete; press_to_continue ;;
+            '')  return 0 ;;
+            m|M) return 99 ;;
+            q|Q) exit 0 ;;
+            *)   log_warn "无效选项: $choice"; press_to_continue ;;
+        esac
+    done
+}
+
+menu_ssh() {
+    if [ ! -f "$SSHD_CONFIG" ]; then
+        log_error "未找到 $SSHD_CONFIG, 请先安装 openssh-server"
+        press_to_continue
+        return 0
+    fi
+    while true; do
+        printf "\n${BLUE}========== SSH 配置 ==========${NC}\n"
+        ssh_status
+        printf "  ${GREEN}1)${NC}  密钥配置 ${MAGENTA}>${NC}\n"
+        printf "  ${GREEN}2)${NC}  端口配置\n"
+        if ssh_password_enabled; then
+            printf "  ${YELLOW}3)${NC}  关闭密码登录 (仅密钥)\n"
+        else
+            printf "  ${GREEN}3)${NC}  开启密码登录\n"
+        fi
+        print_submenu_footer
+        prompt_choice
+
+        case "$choice" in
+            1)    menu_ssh_keys; _r=$?; [ "$_r" -eq 99 ] && return 99 ;;
+            2)    ssh_port_config; press_to_continue ;;
+            3)
+                if ssh_password_enabled; then
+                    ssh_password_disable
+                else
+                    ssh_password_enable
+                fi
+                press_to_continue
+                ;;
+            '')   return 0 ;;
+            m|M)  return 99 ;;
+            q|Q)  exit 0 ;;
+            *)    log_warn "无效选项: $choice"; press_to_continue ;;
+        esac
+    done
+}
+
 menu_main() {
     while true; do
         clear 2>/dev/null || printf "\n\n"
@@ -3784,7 +4212,8 @@ menu_main() {
         printf "  ${GREEN}6)${NC}  TCP 调优 ${MAGENTA}>${NC}\n"
         printf "  ${GREEN}7)${NC}  Realm 配置 ${MAGENTA}>${NC}\n"
         printf "  ${GREEN}8)${NC}  Cloudflare DDNS ${MAGENTA}>${NC}\n"
-        printf "  ${RED}9)${NC}  系统重装 (DD) ${RED}⚠${NC}\n"
+        printf "  ${GREEN}9)${NC}  SSH 配置 ${MAGENTA}>${NC}\n"
+        printf "  ${RED}10)${NC} 系统重装 (DD) ${RED}⚠${NC}\n"
         printf "  ${RED}q)${NC}  退出脚本\n"
         printf "${BLUE}========================================================${NC}\n"
         prompt_choice "请输入选项: "
@@ -3798,7 +4227,8 @@ menu_main() {
             6)    menu_tcp_tune ;;
             7)    menu_realm ;;
             8)    menu_ddns ;;
-            9)    task_system_reinstall; press_to_continue ;;
+            9)    menu_ssh ;;
+            10)   task_system_reinstall; press_to_continue ;;
             q|Q)  printf "${GREEN}再见!${NC}\n"; exit 0 ;;
             ''|m|M) ;;
             *)    log_warn "无效选项: $choice"; press_to_continue ;;
