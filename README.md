@@ -17,8 +17,10 @@ RHEL 系会在需要时自动启用 EPEL 仓库（fail2ban 依赖），并自动
 ## 快速开始
 
 ```bash
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/lengyuic/shell_scripts/refs/heads/main/setup.sh)"
+curl -fsSL https://raw.githubusercontent.com/lengyuic/shell_scripts/refs/heads/main/setup.sh | sh
 ```
+
+> 注意: 不要用 `sh -c "$(curl ...)"` 的形式 —— 脚本体积已超过内核单参数上限 (128KB), 会报 `Argument list too long`。管道方式不受影响, 交互输入走 `/dev/tty`, 菜单功能完全正常。
 
 或下载到本地：
 
