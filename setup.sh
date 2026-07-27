@@ -36,6 +36,7 @@ SINGBOX_CONFIG="/etc/sing-box/config.json"
 SINGBOX_DIR="/etc/sing-box"
 NFT_CONF="/etc/nftables.conf"
 NFT_TABLE="landing_whitelist"
+NFT_WL_FILE="/etc/landing_whitelist.conf"
 NTP_SERVERS_FILE="/etc/ntp_servers.conf"
 CHRONY_CONF="/etc/chrony/chrony.conf"
 CHRONY_MARK_BEGIN="# === BEGIN setup.sh CUSTOM SOURCES ==="
@@ -1638,7 +1639,28 @@ nft_get_whitelist() {
         | grep -E '^[0-9].*'
 }
 
-# 创建空的 landing_whitelist 框架 (set+input/forward/output)
+# 把当前白名单备份到独立文件 (set 不存在时保持原备份不动)
+nft_save_whitelist_file() {
+    nft_set_exists || return 0
+    nft_get_whitelist > "$NFT_WL_FILE"
+}
+
+# 从备份文件恢复白名单到 set
+nft_restore_whitelist_file() {
+    [ -s "$NFT_WL_FILE" ] || return 0
+    restored=0
+    while IFS= read -r ip; do
+        [ -z "$ip" ] && continue
+        if nft add element inet "$NFT_TABLE" admin_ip4 "{ $ip }" 2>/dev/null; then
+            restored=$((restored + 1))
+        fi
+    done < "$NFT_WL_FILE"
+    if [ "$restored" -gt 0 ]; then
+        log_info "已从 $NFT_WL_FILE 恢复 $restored 个白名单 IP"
+    fi
+}
+
+# 创建空的 landing_whitelist 框架 (set+input/forward/output), 并恢复已备份的白名单
 nft_init_table() {
     log_info "初始化 table inet $NFT_TABLE..."
     nft -f - <<EOF
@@ -1664,9 +1686,12 @@ table inet $NFT_TABLE {
     }
 }
 EOF
+    _ret=$?
+    [ "$_ret" -eq 0 ] && nft_restore_whitelist_file
+    return "$_ret"
 }
 
-# 把 live ruleset 持久化到 /etc/nftables.conf (包括用户其他 table)
+# 把 live ruleset 持久化到 /etc/nftables.conf (包括用户其他 table), 同时备份白名单
 nft_persist() {
     {
         echo "#!/usr/sbin/nft -f"
@@ -1675,6 +1700,7 @@ nft_persist() {
         echo ""
         nft list ruleset 2>/dev/null
     } > "$NFT_CONF"
+    nft_save_whitelist_file
     log_info "ruleset 已持久化到 $NFT_CONF"
 }
 
@@ -1748,13 +1774,21 @@ firewall_enable() {
 
     if ! nft_table_exists; then
         log_warn "table inet $NFT_TABLE 不存在, 即将创建"
-        log_warn "⚠️ 创建后 input 默认策略为 drop, 必须在 set 中至少有一个 IP 才能远程访问"
-        confirm "确认创建空表?" || { log_warn "已取消"; return 0; }
+        if [ -s "$NFT_WL_FILE" ]; then
+            log_info "检测到已保存的白名单 ($(grep -c . "$NFT_WL_FILE") 个 IP), 创建后将自动恢复"
+        else
+            log_warn "⚠️ 创建后 input 默认策略为 drop, 必须在 set 中至少有一个 IP 才能远程访问"
+        fi
+        confirm "确认创建?" || { log_warn "已取消"; return 0; }
         nft_init_table || { log_error "创建失败"; return 1; }
     fi
 
-    # 检查白名单是否为空
+    # set 为空时尝试从备份恢复, 再检查是否仍为空
     cnt=$(nft_get_whitelist | grep -c .)
+    if [ "$cnt" -eq 0 ]; then
+        nft_restore_whitelist_file
+        cnt=$(nft_get_whitelist | grep -c .)
+    fi
     if [ "$cnt" -eq 0 ]; then
         log_warn "⚠️ 白名单 set 为空, 你将无法远程访问! 请立即添加你的 IP"
     fi
@@ -1774,9 +1808,13 @@ firewall_disable() {
         return 0
     fi
     if nft_table_exists; then
+        nft_save_whitelist_file
         nft delete table inet "$NFT_TABLE"
         log_info "已移除 table inet ${NFT_TABLE}"
         nft_persist
+        if [ -s "$NFT_WL_FILE" ]; then
+            log_info "白名单已保存到 $NFT_WL_FILE (共 $(grep -c . "$NFT_WL_FILE") 个 IP), 重新启用时自动恢复"
+        fi
     else
         log_warn "table inet ${NFT_TABLE} 不存在, 无需禁用"
     fi
@@ -1790,9 +1828,13 @@ nft_clear() {
     fi
     log_warn "⚠️ 此操作会清空所有 nft 规则, 包括你手动添加的其他 table"
     confirm "确认清空所有 nftables 规则?" || { log_warn "已取消"; return 0; }
+    nft_save_whitelist_file
     nft flush ruleset
     : > "$NFT_CONF"
     log_info "已清空 nftables 全部规则"
+    if [ -s "$NFT_WL_FILE" ]; then
+        log_info "白名单已保存到 $NFT_WL_FILE, 重新启用防火墙时自动恢复"
+    fi
 }
 
 whitelist_view() {
