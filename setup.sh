@@ -1,21 +1,17 @@
 #!/bin/sh
 
 # ================================================================
-# Linux VPS 一键配置脚本 (多发行版自动识别 / 多级菜单整合版)
+# Linux VPS 一键配置脚本 (多发行版自动识别 / 单键菜单版)
 # 支持: Debian/Ubuntu (apt) · RHEL/CentOS/Rocky/AlmaLinux/Fedora (dnf/yum)
 #       Arch (pacman) · Alpine (apk) · openSUSE (zypper)
-# 主菜单:
-#   1. 安装常用软件
-#   2. 配置 NTP        (子菜单)
-#   3. Fail2Ban        (子菜单)
-#   4. Sing-Box 配置   (子菜单)
-#   5. 防火墙配置      (子菜单)
-#   6. TCP 调优        (子菜单)
-#   7. Realm 配置      (子菜单)
-#   8. Cloudflare DDNS (子菜单)
-#   9. SSH 配置        (子菜单: 密钥/端口/密码登录)
-#   10. 系统重装 (DD)
-#   q. 退出
+# 交互: 单键直达 (按键立即生效, 无需回车)
+#   0/ESC 返回上层 · m 直回主菜单 · q 随处退出
+#   主菜单为仪表盘, 实时显示各模块状态 (● 运行中 / ○ 未安装)
+# 模块:
+#   1 安装常用软件      2 NTP 时间同步     3 Fail2Ban
+#   4 Sing-Box          5 防火墙(nftables)  6 TCP 调优(BBR)
+#   7 Realm 转发        8 Cloudflare DDNS  9 SSH 配置
+#   d 系统重装 (DD)
 # 用法: sudo sh setup.sh
 # ================================================================
 
@@ -26,7 +22,9 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 MAGENTA='\033[0;35m'
+GRAY='\033[0;90m'
 NC='\033[0m'
+ESC_CH=$(printf '\033')
 
 # --- 日志辅助函数 ---
 log_info()  { printf "${GREEN}[INFO]${NC} %s\n" "$1"; }
@@ -205,16 +203,37 @@ read_tty() {
     fi
 }
 
-# --- 通用: 读取交互输入 ---
+# --- 通用: 读取单个按键到全局变量 KEY (无需回车) ---
+# ESC 及方向键等转义序列统一映射为 KEY="ESC"; 回车映射为 KEY=""
+key_read() {
+    KEY=""
+    if [ -r /dev/tty ] && _stty_old=$(stty -g < /dev/tty 2>/dev/null) && [ -n "$_stty_old" ]; then
+        stty -icanon -echo min 1 time 0 < /dev/tty 2>/dev/null
+        KEY=$(dd if=/dev/tty bs=1 count=1 2>/dev/null)
+        if [ "$KEY" = "$ESC_CH" ]; then
+            # 吞掉方向键等 CSI 后续字节 (0.2s 内到达的)
+            stty -icanon -echo min 0 time 2 < /dev/tty 2>/dev/null
+            dd if=/dev/tty bs=16 count=1 >/dev/null 2>&1
+            KEY="ESC"
+        fi
+        stty "$_stty_old" < /dev/tty 2>/dev/null
+    else
+        # 无 tty: 回退为行输入, 取首字符; 读取失败 (EOF) 时退出避免死循环
+        read_tty KEY || { log_error "无法读取输入, 退出"; exit 1; }
+        [ -n "$KEY" ] && KEY=${KEY%"${KEY#?}"}
+    fi
+}
+
+# --- 通用: 读取交互输入 (行输入, 用于表单) ---
 read_input() {
     prompt="$1"
     default="$2"
     varname="$3"
 
     if [ -n "$default" ]; then
-        printf "${CYAN}%s [默认: %s]: ${NC}" "$prompt" "$default"
+        printf "  ${CYAN}%s ${GRAY}[默认: %s]${NC}${CYAN} > ${NC}" "$prompt" "$default"
     else
-        printf "${CYAN}%s: ${NC}" "$prompt"
+        printf "  ${CYAN}%s > ${NC}" "$prompt"
     fi
 
     read_tty input
@@ -225,44 +244,86 @@ read_input() {
     eval "$varname=\"\$input\""
 }
 
-# --- 等待回车继续 ---
+# --- 等待任意按键 ---
 press_to_continue() {
-    printf "\n${YELLOW}按回车键继续...${NC}"
-    read_tty _dummy
+    printf "\n${GRAY}── 按任意键返回 ──${NC}"
+    key_read
+    printf "\n"
 }
 
-# --- 菜单: 打印通用 返回/退出 脚注 ---
-print_submenu_footer() {
-    printf "\n  ${YELLOW}[回车]${NC} 返回上层    ${YELLOW}m${NC} 主菜单    ${YELLOW}q${NC} 退出\n"
+# --- 单键确认: confirm "提示" [默认 y|n] ; 返回 0=是 ---
+# 按 y=是, 回车=默认值, 其余任意键=否
+confirm() {
+    _def="${2:-n}"
+    if [ "$_def" = "y" ]; then _hint="Y/n"; else _hint="y/N"; fi
+    printf "  ${CYAN}%s [%s] ${NC}" "$1" "$_hint"
+    key_read
+    case "$KEY" in
+        y|Y) printf "y\n"; return 0 ;;
+        '')  printf "%s\n" "$_def"; [ "$_def" = "y" ] ;;
+        *)   printf "n\n"; return 1 ;;
+    esac
 }
 
-# --- 菜单: 打印提示并把选项读入全局变量 choice ---
-prompt_choice() {
-    printf "${CYAN}%s${NC}" "${1:-请选择: }"
-    read_tty choice
+do_quit() {
+    printf "\n${GREEN}再见!${NC}\n"
+    exit 0
 }
 
-# --- 菜单: 通用增删改查 (CRUD) 子菜单 ---
-# 用法: menu_crud <查看函数> <添加函数> <删除函数> <修改函数>
-# 列表始终显示在顶部 (由查看函数输出, 自带标题), 故不再单列“查看”动作
-menu_crud() {
-    _view="$1"; _add="$2"; _del="$3"; _mod="$4"
+# --- 菜单: 清屏 + 面包屑标题 + 系统信息行 ---
+menu_header() {
+    clear 2>/dev/null || printf '\n\n'
+    printf "${BLUE}━━ VPS Setup"
+    [ -n "$1" ] && printf " › %s" "$1"
+    printf " ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+    printf "  ${GRAY}%s · %s%s${NC}\n\n" \
+        "${OS_PRETTY:-未知系统}" "${PKG_MGR:-无包管理器}" "${IP_CACHE:+ · $IP_CACHE}"
+}
+
+# ================================================================
+# 菜单框架: 单键直达
+#   run_menu <面包屑> <状态函数|-> <条目函数> [top]
+#   条目函数每行输出:  按键|标签|处理函数|类型
+#     类型: act = 执行后等待按键返回 (默认)   sub = 进入子菜单
+#   导航: 0/ESC 返回上层, m 直回主菜单 (经 NAV 标志逐层退出), q 退出
+#   第 4 参数 top 表示主菜单: 0/ESC/m 不生效, NAV 到此复位
+# ================================================================
+NAV=""
+
+run_menu() {
     while true; do
-        printf "\n"
-        "$_view"
-        printf "${BLUE}---------------- 操作 ----------------${NC}\n"
-        printf "  ${GREEN}1)${NC} 添加    ${GREEN}2)${NC} 删除    ${GREEN}3)${NC} 修改\n"
-        print_submenu_footer
-        prompt_choice
-        case "$choice" in
-            1)   while "$_add"; do :; done; press_to_continue ;;
-            2)   while "$_del"; do :; done; press_to_continue ;;
-            3)   "$_mod"; press_to_continue ;;
-            '')  return 0 ;;
-            m|M) return 99 ;;
-            q|Q) exit 0 ;;
-            *)   log_warn "无效选项: $choice"; press_to_continue ;;
+        if [ "$NAV" = "main" ]; then
+            if [ -n "$4" ]; then NAV=""; else return 0; fi
+        fi
+        menu_header "$1"
+        if [ "$2" != "-" ]; then "$2"; printf "\n"; fi
+        "$3" | while IFS='|' read -r _mk _mlbl _mfn _mtp; do
+            [ -n "$_mk" ] || continue
+            printf "  ${GREEN}[%s]${NC} %b\n" "$_mk" "$_mlbl"
+        done
+        if [ -n "$4" ]; then
+            printf "\n  ${GRAY}按键直达 · [q] 退出${NC}\n"
+        else
+            printf "\n  ${GRAY}按键直达 · [0/ESC] 返回 · [m] 主菜单 · [q] 退出${NC}\n"
+        fi
+        key_read
+        case "$KEY" in
+            q|Q)   do_quit ;;
+            0|ESC) [ -n "$4" ] && continue; return 0 ;;
+            m|M)   [ -n "$4" ] && continue; NAV="main"; return 0 ;;
+            '')    continue ;;
         esac
+        _mline=$("$3" | awk -F'|' -v k="$KEY" '$1==k {print; exit}')
+        [ -n "$_mline" ] || continue
+        _mfn=$(printf '%s\n' "$_mline" | cut -d'|' -f3)
+        _mtp=$(printf '%s\n' "$_mline" | cut -d'|' -f4)
+        printf '\n'
+        if [ "$_mtp" = "sub" ]; then
+            "$_mfn"
+        else
+            "$_mfn"
+            press_to_continue
+        fi
     done
 }
 
@@ -465,11 +526,7 @@ ntp_uninstall() {
         log_warn "chrony 未安装, 无需卸载"
         return 0
     fi
-    read_input "确认卸载 chrony? (yes/no)" "no" CONFIRM
-    if [ "$CONFIRM" != "yes" ]; then
-        log_warn "已取消"
-        return 0
-    fi
+    confirm "确认卸载 chrony?" || { log_warn "已取消"; return 0; }
     systemctl stop "$CHRONY_SERVICE" 2>/dev/null || true
     systemctl disable "$CHRONY_SERVICE" 2>/dev/null || true
     pkg_remove chrony
@@ -775,11 +832,7 @@ fail2ban_uninstall() {
         log_warn "Fail2Ban 未安装, 无需卸载"
         return 0
     fi
-    read_input "确认卸载 Fail2Ban? (yes/no)" "no" CONFIRM
-    if [ "$CONFIRM" != "yes" ]; then
-        log_warn "已取消"
-        return 0
-    fi
+    confirm "确认卸载 Fail2Ban?" || { log_warn "已取消"; return 0; }
     systemctl stop fail2ban 2>/dev/null || true
     systemctl disable fail2ban 2>/dev/null || true
     if [ "$OS_FAMILY" = "rhel" ]; then
@@ -1151,11 +1204,7 @@ singbox_uninstall() {
         log_warn "Sing-Box 未安装, 无需卸载"
         return 0
     fi
-    read_input "确认卸载 Sing-Box? (yes/no)" "no" CONFIRM
-    if [ "$CONFIRM" != "yes" ]; then
-        log_warn "已取消"
-        return 0
-    fi
+    confirm "确认卸载 Sing-Box?" || { log_warn "已取消"; return 0; }
     systemctl stop sing-box 2>/dev/null || true
     systemctl disable sing-box 2>/dev/null || true
     rm -f /etc/systemd/system/sing-box.service /lib/systemd/system/sing-box.service 2>/dev/null
@@ -1355,11 +1404,7 @@ singbox_delete_proxy() {
         log_warn "当前没有代理配置, 无需删除"
         return 0
     fi
-    read_input "确认删除当前代理配置并停止服务? (yes/no)" "no" CONFIRM
-    if [ "$CONFIRM" != "yes" ]; then
-        log_warn "已取消"
-        return 0
-    fi
+    confirm "确认删除当前代理配置并停止服务?" || { log_warn "已取消"; return 0; }
     systemctl stop sing-box 2>/dev/null || true
     systemctl disable sing-box 2>/dev/null || true
     cp "$SINGBOX_CONFIG" "${SINGBOX_CONFIG}.bak.$(date +%s)" 2>/dev/null || true
@@ -1687,11 +1732,7 @@ nft_uninstall() {
         log_warn "nftables 未安装, 无需卸载"
         return 0
     fi
-    read_input "确认卸载 nftables? (yes/no)" "no" CONFIRM
-    if [ "$CONFIRM" != "yes" ]; then
-        log_warn "已取消"
-        return 0
-    fi
+    confirm "确认卸载 nftables?" || { log_warn "已取消"; return 0; }
     systemctl stop nftables 2>/dev/null || true
     systemctl disable nftables 2>/dev/null || true
     pkg_remove nftables
@@ -1708,11 +1749,7 @@ firewall_enable() {
     if ! nft_table_exists; then
         log_warn "table inet $NFT_TABLE 不存在, 即将创建"
         log_warn "⚠️ 创建后 input 默认策略为 drop, 必须在 set 中至少有一个 IP 才能远程访问"
-        read_input "确认创建空表? (yes/no)" "no" CONFIRM
-        if [ "$CONFIRM" != "yes" ]; then
-            log_warn "已取消"
-            return 0
-        fi
+        confirm "确认创建空表?" || { log_warn "已取消"; return 0; }
         nft_init_table || { log_error "创建失败"; return 1; }
     fi
 
@@ -1752,11 +1789,7 @@ nft_clear() {
         return 0
     fi
     log_warn "⚠️ 此操作会清空所有 nft 规则, 包括你手动添加的其他 table"
-    read_input "确认清空所有 nftables 规则? (yes/no)" "no" CONFIRM
-    if [ "$CONFIRM" != "yes" ]; then
-        log_warn "已取消"
-        return 0
-    fi
+    confirm "确认清空所有 nftables 规则?" || { log_warn "已取消"; return 0; }
     nft flush ruleset
     : > "$NFT_CONF"
     log_info "已清空 nftables 全部规则"
@@ -2045,18 +2078,16 @@ ${conf}"
 
     log_warn "发现可能覆盖本脚本的配置:"
     echo "$conflicts" | sed 's/^/  - /'
-    read_input "是否自动禁用这些冲突文件? (yes/no)" "yes" ANS
-    case "$ANS" in
-        yes|y|Y|YES)
-            ts=$(date +%Y%m%d_%H%M%S)
-            echo "$conflicts" | while IFS= read -r conf; do
-                [ -z "$conf" ] && continue
-                mv "$conf" "${conf}.disabled.${ts}" 2>/dev/null || true
-            done
-            log_info "已禁用冲突文件"
-            ;;
-        *) log_warn "已跳过, 若配置未生效请手动检查 /etc/sysctl.d/" ;;
-    esac
+    if confirm "是否自动禁用这些冲突文件?" y; then
+        ts=$(date +%Y%m%d_%H%M%S)
+        echo "$conflicts" | while IFS= read -r conf; do
+            [ -z "$conf" ] && continue
+            mv "$conf" "${conf}.disabled.${ts}" 2>/dev/null || true
+        done
+        log_info "已禁用冲突文件"
+    else
+        log_warn "已跳过, 若配置未生效请手动检查 /etc/sysctl.d/"
+    fi
 }
 
 _bbr_eligible_ifaces() {
@@ -2189,11 +2220,7 @@ bbr_apply() {
     printf "  缓冲区: ${CYAN}%s${NC} MB\n" "$buffer_mb"
     printf "  计算:   BDP × %s, 上限 %s MB\n" "$BBR_BUFFER_MULTIPLIER" "$BBR_BUFFER_MAX_MB"
 
-    read_input "确认应用? (yes/no)" "yes" CONFIRM
-    case "$CONFIRM" in
-        yes|y|Y|YES) ;;
-        *) log_warn "已取消"; return 0 ;;
-    esac
+    confirm "确认应用?" y || { log_warn "已取消"; return 0; }
 
     _bbr_clean_sysctl_conf
     [ -L /etc/sysctl.d/99-sysctl.conf ] && rm -f /etc/sysctl.d/99-sysctl.conf
@@ -2298,11 +2325,7 @@ bbr_remove() {
         log_warn "未检测到本脚本的调优配置, 无需移除"
         return 0
     fi
-    read_input "确认移除? (yes/no)" "no" CONFIRM
-    case "$CONFIRM" in
-        yes|y|Y|YES) ;;
-        *) log_warn "已取消"; return 0 ;;
-    esac
+    confirm "确认移除?" || { log_warn "已取消"; return 0; }
 
     if [ -f "$TCP_TUNE_CONF" ]; then
         rm -f "$TCP_TUNE_CONF"
@@ -2590,11 +2613,7 @@ realm_uninstall() {
         log_warn "未检测到 realm 安装"
         return 0
     fi
-    read_input "确认卸载 realm? (yes/no)" "no" CONFIRM
-    if [ "$CONFIRM" != "yes" ]; then
-        log_warn "已取消"
-        return 0
-    fi
+    confirm "确认卸载 realm?" || { log_warn "已取消"; return 0; }
 
     if [ -n "$REALM_SERVICE" ]; then
         systemctl stop "$REALM_SERVICE" 2>/dev/null || true
@@ -3021,11 +3040,11 @@ ddns_install() {
         *) DDNS_MODE="ipv4" ;;
     esac
 
-    read_input "是否启用 Cloudflare 代理(橙云)? (yes/no)" "no" DDNS_PROXY_CH
-    case "$DDNS_PROXY_CH" in
-        yes|y|Y|YES) DDNS_PROXIED="true" ;;
-        *)           DDNS_PROXIED="false" ;;
-    esac
+    if confirm "是否启用 Cloudflare 代理(橙云)?"; then
+        DDNS_PROXIED="true"
+    else
+        DDNS_PROXIED="false"
+    fi
 
     read_input "TTL 秒数" "60" DDNS_TTL
     case "$DDNS_TTL" in
@@ -3055,11 +3074,7 @@ ddns_install() {
     printf "  模式:    ${CYAN}%s${NC}\n" "$pm"
     printf "  CF 代理: ${CYAN}%s${NC}\n" "$pp"
     printf "  TTL:     ${CYAN}%s${NC}\n" "$DDNS_TTL"
-    read_input "确认安装? (yes/no)" "yes" CONFIRM
-    case "$CONFIRM" in
-        yes|y|Y|YES) ;;
-        *) log_warn "已取消"; return 0 ;;
-    esac
+    confirm "确认安装?" y || { log_warn "已取消"; return 0; }
 
     # A 记录: 不存在则创建占位
     rec=$(curl -s --max-time 10 \
@@ -3317,11 +3332,7 @@ ddns_uninstall() {
         log_warn "DDNS 未安装, 无需卸载"
         return 0
     fi
-    read_input "确认卸载 DDNS? 将移除 cron / 脚本 / Token (yes/no)" "no" CONFIRM
-    if [ "$CONFIRM" != "yes" ]; then
-        log_warn "已取消"
-        return 0
-    fi
+    confirm "确认卸载 DDNS? 将移除 cron / 脚本 / Token" || { log_warn "已取消"; return 0; }
     if command -v crontab >/dev/null 2>&1; then
         ( crontab -l 2>/dev/null | grep -v "ddns.sh" ) | crontab - 2>/dev/null
     fi
@@ -3413,10 +3424,18 @@ task_system_reinstall() {
 
     # Ubuntu 的 --minimal
     if [ "$system" = "ubuntu" ]; then
-        read_input "是否使用 minimal 镜像? (yes/no)" "no" UBU_MIN
-        case "$UBU_MIN" in
-            yes|y|Y|YES) EXTRA_ARG="--minimal" ;;
-        esac
+        if confirm "是否使用 minimal 镜像?"; then
+            EXTRA_ARG="--minimal"
+        fi
+    fi
+
+    # 登录用户名
+    # 上游新版未指定 --username 时会从 stdin 交互询问, 在 curl|sh 场景下
+    # stdin 非终端, read 遇 EOF 且上游 set -eE 会直接崩溃, 因此必须显式传参
+    read_input "新系统登录用户名" "root" NEW_USER
+    if printf '%s' "$NEW_USER" | grep -q '[][/\:|<>+=;,?*%@ ]'; then
+        log_error "用户名包含非法字符: / \\ [ ] : | < > + = ; , ? * % @ 或空格"
+        return 1
     fi
 
     # SSH 端口
@@ -3445,16 +3464,18 @@ task_system_reinstall() {
     printf "  系统:     ${CYAN}%s${NC}\n" "$system"
     [ -n "$VERSION" ]   && printf "  版本:     ${CYAN}%s${NC}\n" "$VERSION"
     [ -n "$EXTRA_ARG" ] && printf "  额外参数: ${CYAN}%s${NC}\n" "$EXTRA_ARG"
+    printf "  用户名:   ${CYAN}%s${NC}\n" "$NEW_USER"
     printf "  SSH 端口: ${CYAN}%s${NC}\n" "$SSH_PORT"
     key_preview=$(printf '%s' "$SSH_KEY" | cut -c1-50)
     printf "  SSH 公钥: ${CYAN}%s...${NC} (长度: %s)\n" "$key_preview" "${#SSH_KEY}"
 
     printf "\n${RED}⚠️  即将执行系统重装. 本次 SSH 会话稍后会断开, 几分钟后机器以新系统启动.${NC}\n"
-    read_input "确认执行重装? (y/n)" "n" CONFIRM
-    case "$CONFIRM" in
-        y|Y|yes|YES) ;;
-        *) log_warn "已取消"; return 0 ;;
-    esac
+    # 高危操作: 保留行输入强确认, 必须完整输入 yes
+    read_input "确认执行重装? 输入 yes 继续" "" CONFIRM
+    if [ "$CONFIRM" != "yes" ]; then
+        log_warn "已取消"
+        return 0
+    fi
 
     # 下载 reinstall.sh
     workdir=$(mktemp -d)
@@ -3470,17 +3491,17 @@ task_system_reinstall() {
     # 构造并执行
     log_info "执行 reinstall.sh..."
     if [ -n "$VERSION" ] && [ -n "$EXTRA_ARG" ]; then
-        log_info "命令: bash reinstall.sh $system $VERSION $EXTRA_ARG --ssh-key '...' --ssh-port $SSH_PORT"
-        bash reinstall.sh "$system" "$VERSION" "$EXTRA_ARG" --ssh-key "$SSH_KEY" --ssh-port "$SSH_PORT"
+        log_info "命令: bash reinstall.sh $system $VERSION $EXTRA_ARG --username $NEW_USER --ssh-key '...' --ssh-port $SSH_PORT"
+        bash reinstall.sh "$system" "$VERSION" "$EXTRA_ARG" --username "$NEW_USER" --ssh-key "$SSH_KEY" --ssh-port "$SSH_PORT"
     elif [ -n "$VERSION" ]; then
-        log_info "命令: bash reinstall.sh $system $VERSION --ssh-key '...' --ssh-port $SSH_PORT"
-        bash reinstall.sh "$system" "$VERSION" --ssh-key "$SSH_KEY" --ssh-port "$SSH_PORT"
+        log_info "命令: bash reinstall.sh $system $VERSION --username $NEW_USER --ssh-key '...' --ssh-port $SSH_PORT"
+        bash reinstall.sh "$system" "$VERSION" --username "$NEW_USER" --ssh-key "$SSH_KEY" --ssh-port "$SSH_PORT"
     elif [ -n "$EXTRA_ARG" ]; then
-        log_info "命令: bash reinstall.sh $system $EXTRA_ARG --ssh-key '...' --ssh-port $SSH_PORT"
-        bash reinstall.sh "$system" "$EXTRA_ARG" --ssh-key "$SSH_KEY" --ssh-port "$SSH_PORT"
+        log_info "命令: bash reinstall.sh $system $EXTRA_ARG --username $NEW_USER --ssh-key '...' --ssh-port $SSH_PORT"
+        bash reinstall.sh "$system" "$EXTRA_ARG" --username "$NEW_USER" --ssh-key "$SSH_KEY" --ssh-port "$SSH_PORT"
     else
-        log_info "命令: bash reinstall.sh $system --ssh-key '...' --ssh-port $SSH_PORT"
-        bash reinstall.sh "$system" --ssh-key "$SSH_KEY" --ssh-port "$SSH_PORT"
+        log_info "命令: bash reinstall.sh $system --username $NEW_USER --ssh-key '...' --ssh-port $SSH_PORT"
+        bash reinstall.sh "$system" --username "$NEW_USER" --ssh-key "$SSH_KEY" --ssh-port "$SSH_PORT"
     fi
 
     ret=$?
@@ -3728,16 +3749,12 @@ ssh_key_generate() {
     printf "${YELLOW}============================================================${NC}\n"
     printf "本地保存为 ~/.ssh/id_ed25519_vps 并执行: ${CYAN}chmod 600 ~/.ssh/id_ed25519_vps${NC}\n"
     printf "登录命令: ${CYAN}ssh -i ~/.ssh/id_ed25519_vps -p %s root@服务器IP${NC}\n" "$(get_ssh_port)"
-    read_input "是否从服务器删除私钥文件 (保存好后建议删除)? (y/N)" "N" del_key
-    case "$del_key" in
-        y|Y)
-            rm -f "$keyfile"
-            log_info "服务器上的私钥文件已删除"
-            ;;
-        *)
-            log_warn "私钥保留在: $keyfile"
-            ;;
-    esac
+    if confirm "是否从服务器删除私钥文件 (保存好后建议删除)?"; then
+        rm -f "$keyfile"
+        log_info "服务器上的私钥文件已删除"
+    else
+        log_warn "私钥保留在: $keyfile"
+    fi
 }
 
 ssh_key_delete() {
@@ -3792,8 +3809,7 @@ ssh_port_config() {
             return 0
         fi
     fi
-    read_input "确认将 SSH 端口改为 $new_port? (y/N)" "N" confirm
-    case "$confirm" in y|Y) ;; *) log_warn "已取消"; return 0 ;; esac
+    confirm "确认将 SSH 端口改为 $new_port?" || { log_warn "已取消"; return 0; }
 
     ssh_backup_config
     ssh_config_set Port "$new_port"
@@ -3837,8 +3853,7 @@ ssh_password_disable() {
 }
 
 ssh_password_enable() {
-    read_input "确认重新开启密码登录? (y/N)" "N" confirm
-    case "$confirm" in y|Y) ;; *) log_warn "已取消"; return 0 ;; esac
+    confirm "确认重新开启密码登录?" || { log_warn "已取消"; return 0; }
     ssh_backup_config
     ssh_config_set PasswordAuthentication yes
     if sshd -T 2>/dev/null | grep -q '^kbdinteractiveauthentication'; then
@@ -3853,388 +3868,291 @@ ssh_password_enable() {
 # ================================================================
 # 子菜单: NTP 服务器 (增删改查)
 # ================================================================
-menu_ntp_servers() {
-    menu_crud ntp_servers_view ntp_servers_add ntp_servers_delete ntp_servers_modify
+# ================================================================
+# 模块状态速览 (主菜单仪表盘)
+# ================================================================
+svc_active() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl is-active --quiet "$1" 2>/dev/null && return 0
+    fi
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service "$1" status >/dev/null 2>&1 && return 0
+    fi
+    pidof "$1" >/dev/null 2>&1
+}
+
+# brief_svc <二进制> <服务名>: 输出 未安装/运行中/已停止 状态点
+brief_svc() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        printf '%s' "${GRAY}○ 未安装${NC}"
+    elif svc_active "$2"; then
+        printf '%s' "${GREEN}● 运行中${NC}"
+    else
+        printf '%s' "${YELLOW}○ 已停止${NC}"
+    fi
+}
+
+brief_firewall() {
+    if ! command -v nft >/dev/null 2>&1; then
+        printf '%s' "${GRAY}○ 未安装${NC}"
+    elif nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        printf '%s' "${GREEN}● 已启用${NC}"
+    else
+        printf '%s' "${YELLOW}○ 未启用${NC}"
+    fi
+}
+
+brief_tcp() {
+    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
+        printf '%s' "${GREEN}● BBR${NC}"
+    else
+        printf '%s' "${GRAY}○ 未启用${NC}"
+    fi
+}
+
+brief_ddns() {
+    if [ ! -f "$DDNS_SCRIPT" ]; then
+        printf '%s' "${GRAY}○ 未配置${NC}"
+    elif ddns_cron_enabled; then
+        printf '%s' "${GREEN}● 自动更新${NC}"
+    else
+        printf '%s' "${YELLOW}● 已暂停${NC}"
+    fi
+}
+
+brief_ssh() {
+    if [ ! -f "$SSHD_CONFIG" ]; then
+        printf '%s' "${GRAY}○ 未检测到${NC}"
+        return
+    fi
+    _p=$(get_ssh_port)
+    if ssh_password_enabled; then
+        printf '%s' "端口 ${_p} · ${YELLOW}密码开${NC}"
+    else
+        printf '%s' "端口 ${_p} · ${GREEN}仅密钥${NC}"
+    fi
 }
 
 # ================================================================
 # 子菜单: NTP
 # ================================================================
-menu_ntp() {
-    while true; do
-        printf "\n${BLUE}========== NTP (chrony) 配置 ==========${NC}\n"
-        ntp_status
-        printf "  ${GREEN}1)${NC}  安装 chrony\n"
-        printf "  ${GREEN}2)${NC}  卸载 chrony\n"
-        printf "  ${GREEN}3)${NC}  启用 NTP\n"
-        printf "  ${GREEN}4)${NC}  禁用 NTP\n"
-        printf "  ${GREEN}5)${NC}  查看详细状态\n"
-        printf "  ${GREEN}6)${NC}  配置 NTP 服务器 (增删改查) ${MAGENTA}>${NC}\n"
-        printf "  ${GREEN}7)${NC}  强制同步一次\n"
-        print_submenu_footer
-        prompt_choice
-
-        case "$choice" in
-            1)    ntp_install; press_to_continue ;;
-            2)    ntp_uninstall; press_to_continue ;;
-            3)    ntp_enable; press_to_continue ;;
-            4)    ntp_disable; press_to_continue ;;
-            5)    ntp_view_detail; press_to_continue ;;
-            6)    menu_ntp_servers; _r=$?; [ "$_r" -eq 99 ] && return 99 ;;
-            7)    ntp_force_sync; press_to_continue ;;
-            '')   return 0 ;;
-            m|M)  return 99 ;;
-            q|Q)  exit 0 ;;
-            *)    log_warn "无效选项: $choice"; press_to_continue ;;
-        esac
-    done
+ntp_servers_items() {
+    printf '%s\n' "1|添加服务器|ntp_servers_add|act"
+    printf '%s\n' "2|删除服务器|ntp_servers_delete|act"
+    printf '%s\n' "3|修改服务器|ntp_servers_modify|act"
 }
+menu_ntp_servers() { run_menu "NTP › 服务器列表" ntp_servers_view ntp_servers_items; }
 
-# ================================================================
-# 子菜单: Fail2Ban 监狱 (增删改查)
-# ================================================================
-menu_fail2ban_jails() {
-    menu_crud fail2ban_jail_view fail2ban_jail_add fail2ban_jail_delete fail2ban_jail_modify
+# 状态自适应: 未安装只给安装; 运行中给同步/停止; 已停止给启动
+ntp_items() {
+    if ! command -v chronyd >/dev/null 2>&1; then
+        printf '%s\n' "1|安装 chrony|ntp_install|act"
+        return 0
+    fi
+    if svc_active "$CHRONY_SERVICE"; then
+        printf '%s\n' "1|强制同步一次|ntp_force_sync|act"
+        printf '%s\n' "2|配置 NTP 服务器 ›|menu_ntp_servers|sub"
+        printf '%s\n' "3|查看详细状态|ntp_view_detail|act"
+        printf '%s\n' "4|停止 NTP 同步|ntp_disable|act"
+    else
+        printf '%s\n' "1|启动 NTP 同步|ntp_enable|act"
+        printf '%s\n' "2|配置 NTP 服务器 ›|menu_ntp_servers|sub"
+        printf '%s\n' "3|查看详细状态|ntp_view_detail|act"
+    fi
+    printf '%s\n' "x|卸载 chrony|ntp_uninstall|act"
 }
+menu_ntp() { run_menu "NTP 时间同步" ntp_status ntp_items; }
 
 # ================================================================
 # 子菜单: Fail2Ban
 # ================================================================
-menu_fail2ban() {
-    while true; do
-        printf "\n${BLUE}========== Fail2Ban 配置 ==========${NC}\n"
-        fail2ban_status
-        printf "  ${GREEN}1)${NC}  安装 Fail2Ban\n"
-        printf "  ${GREEN}2)${NC}  卸载 Fail2Ban\n"
-        printf "  ${GREEN}3)${NC}  启用 Fail2Ban (读取监狱配置并启动)\n"
-        printf "  ${GREEN}4)${NC}  禁用 Fail2Ban\n"
-        printf "  ${GREEN}5)${NC}  配置监狱 (增删改查) ${MAGENTA}>${NC}\n"
-        printf "  ${GREEN}6)${NC}  查看监禁状态\n"
-        printf "  ${GREEN}7)${NC}  解封 IP\n"
-        print_submenu_footer
-        prompt_choice
-
-        case "$choice" in
-            1)    fail2ban_install; press_to_continue ;;
-            2)    fail2ban_uninstall; press_to_continue ;;
-            3)    fail2ban_enable; press_to_continue ;;
-            4)    fail2ban_disable; press_to_continue ;;
-            5)    menu_fail2ban_jails; _r=$?; [ "$_r" -eq 99 ] && return 99 ;;
-            6)    fail2ban_view; press_to_continue ;;
-            7)    fail2ban_unban; press_to_continue ;;
-            '')   return 0 ;;
-            m|M)  return 99 ;;
-            q|Q)  exit 0 ;;
-            *)    log_warn "无效选项: $choice"; press_to_continue ;;
-        esac
-    done
+fail2ban_jails_items() {
+    printf '%s\n' "1|添加监狱|fail2ban_jail_add|act"
+    printf '%s\n' "2|删除监狱|fail2ban_jail_delete|act"
+    printf '%s\n' "3|修改监狱|fail2ban_jail_modify|act"
 }
+menu_fail2ban_jails() { run_menu "Fail2Ban › 监狱列表" fail2ban_jail_view fail2ban_jails_items; }
 
-# ================================================================
-# 子菜单: Sing-Box 配置代理
-# ================================================================
-menu_singbox_proxy() {
-    while true; do
-        printf "\n${BLUE}====== Sing-Box 配置代理 ======${NC}\n"
-        printf "  ${GREEN}1)${NC}  Shadowsocks-2022\n"
-        printf "  ${GREEN}2)${NC}  VLESS + Reality\n"
-        print_submenu_footer
-        prompt_choice
-
-        case "$choice" in
-            1)    singbox_configure_ss2022; press_to_continue ;;
-            2)    singbox_configure_vless_reality; press_to_continue ;;
-            '')   return 0 ;;
-            m|M)  return 99 ;;
-            q|Q)  exit 0 ;;
-            *)    log_warn "无效选项: $choice"; press_to_continue ;;
-        esac
-    done
+# 状态自适应: 运行中给查看/解封; 已停止给启用
+fail2ban_items() {
+    if ! command -v fail2ban-server >/dev/null 2>&1; then
+        printf '%s\n' "1|安装 Fail2Ban|fail2ban_install|act"
+        return 0
+    fi
+    if svc_active fail2ban; then
+        printf '%s\n' "1|查看监禁状态|fail2ban_view|act"
+        printf '%s\n' "2|解封 IP|fail2ban_unban|act"
+        printf '%s\n' "3|配置监狱 ›|menu_fail2ban_jails|sub"
+        printf '%s\n' "4|停止 Fail2Ban|fail2ban_disable|act"
+    else
+        printf '%s\n' "1|启用 Fail2Ban (读取监狱配置并启动)|fail2ban_enable|act"
+        printf '%s\n' "2|配置监狱 ›|menu_fail2ban_jails|sub"
+    fi
+    printf '%s\n' "x|卸载 Fail2Ban|fail2ban_uninstall|act"
 }
+menu_fail2ban() { run_menu "Fail2Ban" fail2ban_status fail2ban_items; }
 
 # ================================================================
 # 子菜单: Sing-Box
 # ================================================================
-menu_singbox() {
-    while true; do
-        printf "\n${BLUE}========== Sing-Box 配置 ==========${NC}\n"
-        singbox_status
-        printf "  ${GREEN}1)${NC}  安装 Sing-Box\n"
-        printf "  ${GREEN}2)${NC}  卸载 Sing-Box\n"
-        printf "  ${GREEN}3)${NC}  配置代理 ${MAGENTA}>${NC}\n"
-        printf "  ${GREEN}4)${NC}  查看代理链接\n"
-        printf "  ${GREEN}5)${NC}  删除代理\n"
-        printf "  ${GREEN}6)${NC}  重启代理\n"
-        print_submenu_footer
-        prompt_choice
-
-        case "$choice" in
-            1)    singbox_install; press_to_continue ;;
-            2)    singbox_uninstall; press_to_continue ;;
-            3)    menu_singbox_proxy; _r=$?; [ "$_r" -eq 99 ] && return 99 ;;
-            4)    singbox_view_link; press_to_continue ;;
-            5)    singbox_delete_proxy; press_to_continue ;;
-            6)    singbox_restart_proxy; press_to_continue ;;
-            '')   return 0 ;;
-            m|M)  return 99 ;;
-            q|Q)  exit 0 ;;
-            *)    log_warn "无效选项: $choice"; press_to_continue ;;
-        esac
-    done
+# 状态自适应: 未安装→安装; 未配置→选协议 (原"配置代理"子层已拍平); 已配置→日常操作
+singbox_items() {
+    if ! command -v sing-box >/dev/null 2>&1; then
+        printf '%s\n' "1|安装 Sing-Box|singbox_install|act"
+        return 0
+    fi
+    if [ ! -f "$SINGBOX_CONFIG" ]; then
+        printf '%s\n' "1|配置 Shadowsocks-2022|singbox_configure_ss2022|act"
+        printf '%s\n' "2|配置 VLESS + Reality|singbox_configure_vless_reality|act"
+    else
+        printf '%s\n' "1|查看代理链接|singbox_view_link|act"
+        printf '%s\n' "2|重启代理|singbox_restart_proxy|act"
+        printf '%s\n' "3|重新配置 Shadowsocks-2022|singbox_configure_ss2022|act"
+        printf '%s\n' "4|重新配置 VLESS + Reality|singbox_configure_vless_reality|act"
+        printf '%s\n' "5|删除代理配置|singbox_delete_proxy|act"
+    fi
+    printf '%s\n' "x|卸载 Sing-Box|singbox_uninstall|act"
 }
-
-# ================================================================
-# 子菜单: 入站 IP 配置 (增删改查)
-# ================================================================
-menu_firewall_ip() {
-    menu_crud whitelist_view whitelist_add whitelist_delete whitelist_modify
-}
+menu_singbox() { run_menu "Sing-Box" singbox_status singbox_items; }
 
 # ================================================================
 # 子菜单: 防火墙
 # ================================================================
-menu_firewall() {
-    while true; do
-        printf "\n${BLUE}========== 防火墙配置 ==========${NC}\n"
-        nft_status
-        printf "  ${GREEN}1)${NC}  安装 nftables\n"
-        printf "  ${GREEN}2)${NC}  卸载 nftables\n"
-        printf "  ${GREEN}3)${NC}  启用防火墙\n"
-        printf "  ${GREEN}4)${NC}  禁用防火墙\n"
-        printf "  ${GREEN}5)${NC}  配置入站 IP (增删改查) ${MAGENTA}>${NC}\n"
-        printf "  ${GREEN}6)${NC}  查看入站 IP\n"
-        printf "  ${GREEN}7)${NC}  清空 nft\n"
-        print_submenu_footer
-        prompt_choice
-
-        case "$choice" in
-            1)    nft_install; press_to_continue ;;
-            2)    nft_uninstall; press_to_continue ;;
-            3)    firewall_enable; press_to_continue ;;
-            4)    firewall_disable; press_to_continue ;;
-            5)    menu_firewall_ip; _r=$?; [ "$_r" -eq 99 ] && return 99 ;;
-            6)    whitelist_view; press_to_continue ;;
-            7)    nft_clear; press_to_continue ;;
-            '')   return 0 ;;
-            m|M)  return 99 ;;
-            q|Q)  exit 0 ;;
-            *)    log_warn "无效选项: $choice"; press_to_continue ;;
-        esac
-    done
+firewall_ip_items() {
+    printf '%s\n' "1|添加 IP|whitelist_add|act"
+    printf '%s\n' "2|删除 IP|whitelist_delete|act"
+    printf '%s\n' "3|修改 IP|whitelist_modify|act"
 }
+menu_firewall_ip() { run_menu "防火墙 › 入站 IP" whitelist_view firewall_ip_items; }
 
-# ================================================================
-# 主菜单
-# ================================================================
-# ================================================================
-# 子菜单: Realm 转发规则 (增删改查)
-# ================================================================
-menu_realm_endpoints() {
-    menu_crud realm_endpoints_view realm_endpoint_add realm_endpoint_delete realm_endpoint_modify
+# 状态自适应: 未安装→安装; 未启用→启用优先; 已启用→配置优先
+firewall_items() {
+    if ! command -v nft >/dev/null 2>&1; then
+        printf '%s\n' "1|安装 nftables|nft_install|act"
+        return 0
+    fi
+    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        printf '%s\n' "1|配置入站 IP ›|menu_firewall_ip|sub"
+        printf '%s\n' "2|禁用防火墙|firewall_disable|act"
+        printf '%s\n' "3|清空 nft 规则|nft_clear|act"
+    else
+        printf '%s\n' "1|启用防火墙|firewall_enable|act"
+        printf '%s\n' "2|配置入站 IP ›|menu_firewall_ip|sub"
+    fi
+    printf '%s\n' "x|卸载 nftables|nft_uninstall|act"
 }
+menu_firewall() { run_menu "防火墙 (nftables)" nft_status firewall_items; }
 
 # ================================================================
 # 子菜单: Realm
 # ================================================================
-menu_realm() {
-    while true; do
-        printf "\n${BLUE}========== Realm 配置 ==========${NC}\n"
-        realm_status
-        printf "  ${GREEN}1)${NC}  安装 realm\n"
-        printf "  ${GREEN}2)${NC}  卸载 realm\n"
-        printf "  ${GREEN}3)${NC}  启用 realm\n"
-        printf "  ${GREEN}4)${NC}  禁用 realm\n"
-        printf "  ${GREEN}5)${NC}  重启 realm\n"
-        printf "  ${GREEN}6)${NC}  配置转发规则 (增删改查) ${MAGENTA}>${NC}\n"
-        printf "  ${GREEN}7)${NC}  查看完整配置\n"
-        print_submenu_footer
-        prompt_choice
-
-        case "$choice" in
-            1)    realm_install; press_to_continue ;;
-            2)    realm_uninstall; press_to_continue ;;
-            3)    realm_enable; press_to_continue ;;
-            4)    realm_disable; press_to_continue ;;
-            5)    realm_restart; press_to_continue ;;
-            6)    menu_realm_endpoints; _r=$?; [ "$_r" -eq 99 ] && return 99 ;;
-            7)    realm_view_config; press_to_continue ;;
-            '')   return 0 ;;
-            m|M)  return 99 ;;
-            q|Q)  exit 0 ;;
-            *)    log_warn "无效选项: $choice"; press_to_continue ;;
-        esac
-    done
+realm_endpoints_items() {
+    printf '%s\n' "1|添加转发规则|realm_endpoint_add|act"
+    printf '%s\n' "2|删除转发规则|realm_endpoint_delete|act"
+    printf '%s\n' "3|修改转发规则|realm_endpoint_modify|act"
 }
+menu_realm_endpoints() { run_menu "Realm › 转发规则" realm_endpoints_view realm_endpoints_items; }
+
+# 状态自适应: 未安装→安装; 运行中→规则/重启/停止; 已停止→启动
+realm_items() {
+    if ! command -v realm >/dev/null 2>&1; then
+        printf '%s\n' "1|安装 realm|realm_install|act"
+        return 0
+    fi
+    printf '%s\n' "1|配置转发规则 ›|menu_realm_endpoints|sub"
+    if svc_active realm; then
+        printf '%s\n' "2|重启 realm|realm_restart|act"
+        printf '%s\n' "3|停止 realm|realm_disable|act"
+        printf '%s\n' "4|查看完整配置|realm_view_config|act"
+    else
+        printf '%s\n' "2|启动 realm|realm_enable|act"
+        printf '%s\n' "3|查看完整配置|realm_view_config|act"
+    fi
+    printf '%s\n' "x|卸载 realm|realm_uninstall|act"
+}
+menu_realm() { run_menu "Realm 转发" realm_status realm_items; }
 
 # ================================================================
 # 子菜单: Cloudflare DDNS
 # ================================================================
-menu_ddns() {
-    while true; do
-        printf "\n${BLUE}========== Cloudflare DDNS ==========${NC}\n"
-        ddns_status
-        if [ ! -f "$DDNS_SCRIPT" ]; then
-            printf "  ${GREEN}1)${NC}  安装并配置 DDNS\n"
-        else
-            printf "  ${GREEN}1)${NC}  重新配置 DDNS\n"
-            printf "  ${GREEN}2)${NC}  立即手动更新一次\n"
-            printf "  ${GREEN}3)${NC}  查看日志\n"
-            if ddns_cron_enabled; then
-                printf "  ${YELLOW}4)${NC}  暂停自动更新\n"
-            else
-                printf "  ${GREEN}4)${NC}  恢复自动更新\n"
-            fi
-            printf "  ${YELLOW}5)${NC}  卸载 DDNS\n"
-        fi
-        print_submenu_footer
-        prompt_choice
-
-        case "$choice" in
-            1)    ddns_install; press_to_continue ;;
-            2)    ddns_run_now; press_to_continue ;;
-            3)    ddns_view_logs; press_to_continue ;;
-            4)
-                if ddns_cron_enabled; then
-                    ddns_pause
-                else
-                    ddns_resume
-                fi
-                press_to_continue
-                ;;
-            5)    ddns_uninstall; press_to_continue ;;
-            '')   return 0 ;;
-            m|M)  return 99 ;;
-            q|Q)  exit 0 ;;
-            *)    log_warn "无效选项: $choice"; press_to_continue ;;
-        esac
-    done
+# 状态自适应: 常用操作优先, 重新配置靠后, 卸载用 x
+ddns_items() {
+    if [ ! -f "$DDNS_SCRIPT" ]; then
+        printf '%s\n' "1|安装并配置 DDNS|ddns_install|act"
+        return 0
+    fi
+    printf '%s\n' "1|立即手动更新一次|ddns_run_now|act"
+    printf '%s\n' "2|查看日志|ddns_view_logs|act"
+    if ddns_cron_enabled; then
+        printf '%s\n' "3|暂停自动更新|ddns_pause|act"
+    else
+        printf '%s\n' "3|恢复自动更新|ddns_resume|act"
+    fi
+    printf '%s\n' "4|重新配置 DDNS|ddns_install|act"
+    printf '%s\n' "x|卸载 DDNS|ddns_uninstall|act"
 }
+menu_ddns() { run_menu "Cloudflare DDNS" ddns_status ddns_items; }
 
 # ================================================================
 # 子菜单: TCP 调优
 # ================================================================
-menu_tcp_tune() {
-    while true; do
-        printf "\n${BLUE}========== TCP 调优 (BBR) ==========${NC}\n"
-        tcp_status
-        printf "  ${GREEN}1)${NC}  应用 BBR 优化 (按带宽+延迟自动计算缓冲)\n"
-        printf "  ${GREEN}2)${NC}  移除 BBR 优化\n"
-        printf "  ${GREEN}3)${NC}  查看当前 TCP 参数\n"
-        print_submenu_footer
-        prompt_choice
-
-        case "$choice" in
-            1)    bbr_apply; press_to_continue ;;
-            2)    bbr_remove; press_to_continue ;;
-            3)    tcp_view_params; press_to_continue ;;
-            '')   return 0 ;;
-            m|M)  return 99 ;;
-            q|Q)  exit 0 ;;
-            *)    log_warn "无效选项: $choice"; press_to_continue ;;
-        esac
-    done
+# 状态自适应: 未启用→应用; 已启用→重新调参/移除
+tcp_items() {
+    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
+        printf '%s\n' "1|重新应用 BBR 优化 (调整带宽/延迟参数)|bbr_apply|act"
+        printf '%s\n' "2|查看当前 TCP 参数|tcp_view_params|act"
+        printf '%s\n' "3|移除 BBR 优化|bbr_remove|act"
+    else
+        printf '%s\n' "1|应用 BBR 优化 (按带宽+延迟自动计算缓冲)|bbr_apply|act"
+        printf '%s\n' "2|查看当前 TCP 参数|tcp_view_params|act"
+    fi
 }
+menu_tcp_tune() { run_menu "TCP 调优 (BBR)" tcp_status tcp_items; }
 
 # ================================================================
 # 子菜单: SSH 配置
 # ================================================================
-menu_ssh_keys() {
-    while true; do
-        printf "\n"
-        ssh_keys_view
-        printf "${BLUE}---------------- 操作 ----------------${NC}\n"
-        printf "  ${GREEN}1)${NC} 粘贴添加公钥    ${GREEN}2)${NC} 生成新密钥对    ${GREEN}3)${NC} 删除公钥\n"
-        print_submenu_footer
-        prompt_choice
-        case "$choice" in
-            1)   ssh_key_add; press_to_continue ;;
-            2)   ssh_key_generate; press_to_continue ;;
-            3)   ssh_key_delete; press_to_continue ;;
-            '')  return 0 ;;
-            m|M) return 99 ;;
-            q|Q) exit 0 ;;
-            *)   log_warn "无效选项: $choice"; press_to_continue ;;
-        esac
-    done
+ssh_keys_items() {
+    printf '%s\n' "1|粘贴添加公钥|ssh_key_add|act"
+    printf '%s\n' "2|生成新密钥对|ssh_key_generate|act"
+    printf '%s\n' "3|删除公钥|ssh_key_delete|act"
 }
+menu_ssh_keys() { run_menu "SSH › 密钥" ssh_keys_view ssh_keys_items; }
 
+ssh_items() {
+    printf '%s\n' "1|密钥配置 ›|menu_ssh_keys|sub"
+    printf '%s\n' "2|端口配置|ssh_port_config|act"
+    if ssh_password_enabled; then
+        printf '%s\n' "3|关闭密码登录 (仅密钥)|ssh_password_disable|act"
+    else
+        printf '%s\n' "3|开启密码登录|ssh_password_enable|act"
+    fi
+}
 menu_ssh() {
     if [ ! -f "$SSHD_CONFIG" ]; then
         log_error "未找到 $SSHD_CONFIG, 请先安装 openssh-server"
         press_to_continue
         return 0
     fi
-    while true; do
-        printf "\n${BLUE}========== SSH 配置 ==========${NC}\n"
-        ssh_status
-        printf "  ${GREEN}1)${NC}  密钥配置 ${MAGENTA}>${NC}\n"
-        printf "  ${GREEN}2)${NC}  端口配置\n"
-        if ssh_password_enabled; then
-            printf "  ${YELLOW}3)${NC}  关闭密码登录 (仅密钥)\n"
-        else
-            printf "  ${GREEN}3)${NC}  开启密码登录\n"
-        fi
-        print_submenu_footer
-        prompt_choice
-
-        case "$choice" in
-            1)    menu_ssh_keys; _r=$?; [ "$_r" -eq 99 ] && return 99 ;;
-            2)    ssh_port_config; press_to_continue ;;
-            3)
-                if ssh_password_enabled; then
-                    ssh_password_disable
-                else
-                    ssh_password_enable
-                fi
-                press_to_continue
-                ;;
-            '')   return 0 ;;
-            m|M)  return 99 ;;
-            q|Q)  exit 0 ;;
-            *)    log_warn "无效选项: $choice"; press_to_continue ;;
-        esac
-    done
+    run_menu "SSH 配置" ssh_status ssh_items
 }
 
-menu_main() {
-    while true; do
-        clear 2>/dev/null || printf "\n\n"
-        printf "${BLUE}========================================================${NC}\n"
-        printf "${BLUE}      Linux VPS 一键配置脚本 (主菜单)${NC}\n"
-        printf "${BLUE}========================================================${NC}\n"
-        printf "  系统: ${CYAN}%s${NC}  |  包管理: ${CYAN}%s${NC}\n" "${OS_PRETTY:-未知}" "${PKG_MGR:-未知}"
-        printf "${BLUE}--------------------------------------------------------${NC}\n"
-        printf "  ${GREEN}1)${NC}  安装常用软件\n"
-        printf "  ${GREEN}2)${NC}  配置 NTP ${MAGENTA}>${NC}\n"
-        printf "  ${GREEN}3)${NC}  Fail2Ban ${MAGENTA}>${NC}\n"
-        printf "  ${GREEN}4)${NC}  Sing-Box 配置 ${MAGENTA}>${NC}\n"
-        printf "  ${GREEN}5)${NC}  防火墙配置 ${MAGENTA}>${NC}\n"
-        printf "  ${GREEN}6)${NC}  TCP 调优 ${MAGENTA}>${NC}\n"
-        printf "  ${GREEN}7)${NC}  Realm 配置 ${MAGENTA}>${NC}\n"
-        printf "  ${GREEN}8)${NC}  Cloudflare DDNS ${MAGENTA}>${NC}\n"
-        printf "  ${GREEN}9)${NC}  SSH 配置 ${MAGENTA}>${NC}\n"
-        printf "  ${RED}10)${NC} 系统重装 (DD) ${RED}⚠${NC}\n"
-        printf "  ${RED}q)${NC}  退出脚本\n"
-        printf "${BLUE}========================================================${NC}\n"
-        prompt_choice "请输入选项: "
-
-        case "$choice" in
-            1)    task_install_common; press_to_continue ;;
-            2)    menu_ntp ;;
-            3)    menu_fail2ban ;;
-            4)    menu_singbox ;;
-            5)    menu_firewall ;;
-            6)    menu_tcp_tune ;;
-            7)    menu_realm ;;
-            8)    menu_ddns ;;
-            9)    menu_ssh ;;
-            10)   task_system_reinstall; press_to_continue ;;
-            q|Q)  printf "${GREEN}再见!${NC}\n"; exit 0 ;;
-            ''|m|M) ;;
-            *)    log_warn "无效选项: $choice"; press_to_continue ;;
-        esac
-    done
+# ================================================================
+# 主菜单 (仪表盘)
+# ================================================================
+main_items() {
+    printf '%s\n' "1|安装常用软件|task_install_common|act"
+    printf '%s\n' "2|NTP 时间同步            $(brief_svc chronyd "$CHRONY_SERVICE")|menu_ntp|sub"
+    printf '%s\n' "3|Fail2Ban                $(brief_svc fail2ban-server fail2ban)|menu_fail2ban|sub"
+    printf '%s\n' "4|Sing-Box                $(brief_svc sing-box sing-box)|menu_singbox|sub"
+    printf '%s\n' "5|防火墙 (nftables)       $(brief_firewall)|menu_firewall|sub"
+    printf '%s\n' "6|TCP 调优 (BBR)          $(brief_tcp)|menu_tcp_tune|sub"
+    printf '%s\n' "7|Realm 转发              $(brief_svc realm realm)|menu_realm|sub"
+    printf '%s\n' "8|Cloudflare DDNS         $(brief_ddns)|menu_ddns|sub"
+    printf '%s\n' "9|SSH 配置                $(brief_ssh)|menu_ssh|sub"
+    printf '%s\n' "d|${RED}系统重装 (DD) ⚠${NC}|task_system_reinstall|act"
 }
+menu_main() { run_menu "主菜单" - main_items top; }
 
 # --- 入口 ---
 check_root
@@ -4246,4 +4164,5 @@ elif [ "$OS_FAMILY" = "unknown" ]; then
     log_warn "未能识别发行版系族 (${OS_PRETTY:-未知}), 将基于包管理器 ($PKG_MGR) 尽力运行"
 fi
 resolve_chrony
+IP_CACHE=$(get_server_ip)
 menu_main
