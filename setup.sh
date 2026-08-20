@@ -9,7 +9,7 @@
 #   主菜单为仪表盘, 实时显示各模块状态 (● 运行中 / ○ 未安装)
 # 模块:
 #   1 安装常用软件      2 NTP 时间同步     3 Fail2Ban
-#   4 Sing-Box          5 防火墙(nftables)  6 TCP 调优(BBR)
+#   4 Sing-Box (SS2022/VLESS-Reality/AnyTLS+ACME)  5 防火墙(nftables)  6 TCP 调优(BBR)
 #   7 Realm 转发        8 Cloudflare DDNS  9 SSH 配置
 #   d 系统重装 (DD)
 # 用法: sudo sh setup.sh
@@ -34,6 +34,7 @@ log_error() { printf "${RED}[ERROR]${NC} %s\n" "$1"; }
 # --- 全局常量 ---
 SINGBOX_CONFIG="/etc/sing-box/config.json"
 SINGBOX_DIR="/etc/sing-box"
+SINGBOX_CERT_DIR="/etc/sing-box/certs"
 NFT_CONF="/etc/nftables.conf"
 NFT_TABLE="landing_whitelist"
 NFT_WL_FILE="/etc/landing_whitelist.conf"
@@ -1302,6 +1303,20 @@ try:
         emit('PRIV_KEY', r.get('private_key', ''))
         sid = r.get('short_id', [])
         emit('SHORT_ID', sid[0] if sid else '')
+    elif t == 'anytls':
+        u = (ib.get('users') or [{}])[0]
+        emit('PASSWORD', u.get('password', ''))
+        tls = ib.get('tls', {})
+        emit('SNI', tls.get('server_name', ''))
+        r = tls.get('reality', {})
+        if r.get('enabled'):
+            emit('TLS_MODE', 'reality')
+            emit('PRIV_KEY', r.get('private_key', ''))
+            sid = r.get('short_id', [])
+            emit('SHORT_ID', sid[0] if sid else '')
+        else:
+            emit('TLS_MODE', 'cert')
+            emit('CERT_PATH', tls.get('certificate_path', ''))
 except Exception as e:
     sys.stderr.write(f'parse error: {e}\n')
     sys.exit(1)
@@ -1388,6 +1403,103 @@ EOF
     }
 }
 EOF
+                printf "${BLUE}========================================================${NC}\n"
+                ;;
+            anytls)
+                if [ "$TLS_MODE" = "reality" ]; then
+                    PUB_KEY=$(derive_x25519_pub_from_priv_b64url "$PRIV_KEY")
+                    if [ -z "$PUB_KEY" ]; then
+                        log_error "无法从 private_key 派生 public_key, 请检查 openssl 是否支持 X25519"
+                        return 1
+                    fi
+                    LINK="anytls://${PASSWORD}@${SERVER_IP}:${PORT}?sni=${SNI}&security=reality&fp=chrome&pbk=${PUB_KEY}&sid=${SHORT_ID}&type=tcp#${TAG_ENCODED}"
+                    TLS_DESC="AnyTLS + Reality"
+                else
+                    # 自签证书的 issuer == subject; 正式证书由 CA 签发, 两者不同
+                    IS_SELF_SIGNED=1
+                    if [ -n "$CERT_PATH" ] && [ -f "$CERT_PATH" ]; then
+                        _sub=$(openssl x509 -in "$CERT_PATH" -noout -subject 2>/dev/null | sed 's/^subject=//')
+                        _iss=$(openssl x509 -in "$CERT_PATH" -noout -issuer 2>/dev/null | sed 's/^issuer=//')
+                        if [ -n "$_sub" ] && [ "$_sub" != "$_iss" ]; then
+                            IS_SELF_SIGNED=0
+                        fi
+                    fi
+                    if [ "$IS_SELF_SIGNED" -eq 0 ]; then
+                        # 证书拿 SNI 校验, 所以连接地址用域名; 走中转时手动改成中转 IP 即可
+                        LINK="anytls://${PASSWORD}@${SNI}:${PORT}?sni=${SNI}&security=tls&type=tcp#${TAG_ENCODED}"
+                        TLS_DESC="AnyTLS + 正式证书"
+                    else
+                        LINK="anytls://${PASSWORD}@${SERVER_IP}:${PORT}?sni=${SNI}&security=tls&type=tcp&insecure=1#${TAG_ENCODED}"
+                        TLS_DESC="AnyTLS + 自签证书"
+                    fi
+                fi
+
+                printf "${BLUE}========================================================${NC}\n"
+                printf "📋 节点信息 (Tag: ${CYAN}%s${NC})  类型: ${CYAN}%s${NC}\n" "$TAG" "$TLS_DESC"
+                printf "${BLUE}========================================================${NC}\n"
+                printf "${CYAN}🚀 AnyTLS 链接:${NC}\n%s\n\n" "$LINK"
+                printf "${CYAN}📄 JSON 客户端配置:${NC}\n"
+                if [ "$TLS_MODE" = "reality" ]; then
+                    cat <<EOF
+{
+    "tag": "${TAG}",
+    "type": "anytls",
+    "server": "${SERVER_IP}",
+    "server_port": ${PORT},
+    "password": "${PASSWORD}",
+    "tls": {
+        "enabled": true,
+        "server_name": "${SNI}",
+        "utls": {
+            "enabled": true,
+            "fingerprint": "chrome"
+        },
+        "reality": {
+            "enabled": true,
+            "public_key": "${PUB_KEY}",
+            "short_id": "${SHORT_ID}"
+        }
+    }
+}
+EOF
+                elif [ "$IS_SELF_SIGNED" -eq 0 ]; then
+                    cat <<EOF
+{
+    "tag": "${TAG}",
+    "type": "anytls",
+    "server": "${SNI}",
+    "server_port": ${PORT},
+    "password": "${PASSWORD}",
+    "tls": {
+        "enabled": true,
+        "server_name": "${SNI}",
+        "utls": {
+            "enabled": true,
+            "fingerprint": "chrome"
+        }
+    }
+}
+EOF
+                else
+                    cat <<EOF
+{
+    "tag": "${TAG}",
+    "type": "anytls",
+    "server": "${SERVER_IP}",
+    "server_port": ${PORT},
+    "password": "${PASSWORD}",
+    "tls": {
+        "enabled": true,
+        "server_name": "${SNI}",
+        "insecure": true,
+        "utls": {
+            "enabled": true,
+            "fingerprint": "chrome"
+        }
+    }
+}
+EOF
+                fi
                 printf "${BLUE}========================================================${NC}\n"
                 ;;
             *)
@@ -1609,6 +1721,383 @@ EOF
     }
 }
 EOF
+        printf "${BLUE}========================================================${NC}\n"
+    )
+}
+
+# ================================================================
+# ACME (Let's Encrypt) 证书模块
+#   为 sing-box 申请正式证书, 装到 $SINGBOX_CERT_DIR/<domain>.{crt,key}
+#   续期由 acme.sh 自带 cron 完成, --reloadcmd 负责重启 sing-box
+# ================================================================
+ACME_BIN="/root/.acme.sh/acme.sh"
+
+acme_ensure_installed() {
+    [ -x "$ACME_BIN" ] && return 0
+    log_info "安装 acme.sh..."
+    if ! command -v curl >/dev/null 2>&1; then
+        pkg_update >/dev/null 2>&1 || true
+        pkg_install curl >/dev/null 2>&1
+    fi
+    curl -fsSL https://get.acme.sh | sh -s "email=admin@${1:-example.com}" >/dev/null 2>&1
+    if [ ! -x "$ACME_BIN" ]; then
+        log_error "acme.sh 安装失败"
+        return 1
+    fi
+    # 默认 CA 换成 Let's Encrypt (acme.sh 新版默认是 ZeroSSL, 需要注册账号)
+    "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1
+    log_info "acme.sh 安装完成"
+}
+
+# 白名单防火墙开启时, LE 验证机的 IP 不在 set 里, 80 端口对它不可达
+acme_warn_firewall() {
+    nft_table_exists || return 0
+    log_warn "⚠️ 检测到白名单防火墙已启用 (input policy drop)"
+    log_warn "   Let's Encrypt 验证机的 IP 不在白名单中, HTTP-01 将无法通过"
+    log_warn "   建议改用 DNS-01, 或先临时关闭防火墙 (5 -> 关闭防火墙)"
+}
+
+# acme_issue_cert <domain>
+# 成功后设置: ACME_CERT_PATH / ACME_KEY_PATH
+acme_issue_cert() {
+    _domain="$1"
+    [ -z "$_domain" ] && { log_error "域名为空"; return 1; }
+
+    mkdir -p "$SINGBOX_CERT_DIR"
+    ACME_CERT_PATH="${SINGBOX_CERT_DIR}/${_domain}.crt"
+    ACME_KEY_PATH="${SINGBOX_CERT_DIR}/${_domain}.key"
+
+    if [ -s "$ACME_CERT_PATH" ] && [ -s "$ACME_KEY_PATH" ]; then
+        log_info "检测到已有证书: $ACME_CERT_PATH"
+        if confirm "直接复用该证书?" y; then
+            return 0
+        fi
+    fi
+
+    acme_ensure_installed "$_domain" || return 1
+
+    printf "  ${CYAN}域名验证方式:${NC}\n"
+    if [ -f "$DDNS_TOKEN_FILE" ]; then
+        printf "    ${CYAN}1)${NC} DNS-01 (Cloudflare, 复用 DDNS 已保存的 Token)  ${GREEN}[推荐]${NC}\n"
+    else
+        printf "    ${CYAN}1)${NC} DNS-01 (Cloudflare, 需输入 API Token)  ${GREEN}[推荐]${NC}\n"
+    fi
+    printf "    ${CYAN}2)${NC} HTTP-01 standalone (需 80 端口对外可达)\n"
+    printf "  ${CYAN}选择 [1/2] ${GRAY}[默认: 1]${NC}${CYAN} > ${NC}"
+    key_read
+    case "$KEY" in
+        2)      printf "2\n"; _method="http" ;;
+        1|'')   printf "1\n"; _method="dns" ;;
+        *)      printf "\n"; log_error "无效选择"; return 1 ;;
+    esac
+
+    if [ "$_method" = "dns" ]; then
+        if [ -f "$DDNS_TOKEN_FILE" ]; then
+            CF_Token=$(cat "$DDNS_TOKEN_FILE")
+            log_info "复用 DDNS 模块保存的 Cloudflare Token"
+        else
+            read_input "Cloudflare API Token (Zone:DNS:Edit 权限)" "" CF_Token
+        fi
+        if [ -z "$CF_Token" ]; then
+            log_error "Token 为空"
+            return 1
+        fi
+        export CF_Token
+        log_info "通过 DNS-01 申请证书 (域名: $_domain)..."
+        "$ACME_BIN" --issue -d "$_domain" --dns dns_cf -k ec-256 || \
+            log_warn "签发未成功, 尝试安装 acme.sh 中已有的证书..."
+    else
+        acme_warn_firewall
+        if ! command -v socat >/dev/null 2>&1; then
+            log_info "安装 socat (standalone 模式依赖)..."
+            pkg_update >/dev/null 2>&1 || true
+            pkg_install socat >/dev/null 2>&1 || log_warn "socat 安装失败, standalone 可能不可用"
+        fi
+        if ss -lnt 2>/dev/null | grep -q ':80[[:space:]]'; then
+            log_warn "80 端口已被占用, 请先停掉占用进程"
+            return 1
+        fi
+        log_info "通过 HTTP-01 standalone 申请证书 (域名: $_domain)..."
+        "$ACME_BIN" --issue -d "$_domain" --standalone --httpport 80 -k ec-256 || \
+            log_warn "签发未成功, 尝试安装 acme.sh 中已有的证书..."
+    fi
+
+    # --ecc 对应 -k ec-256; reloadcmd 保证续期后 sing-box 重新加载证书
+    if ! "$ACME_BIN" --install-cert -d "$_domain" --ecc \
+            --fullchain-file "$ACME_CERT_PATH" \
+            --key-file "$ACME_KEY_PATH" \
+            --reloadcmd "systemctl restart sing-box"; then
+        log_error "证书安装失败, 请确认: ① 域名已解析到本机 ② 验证方式可用 ③ acme.sh 中已有该域名证书"
+        return 1
+    fi
+    if [ ! -s "$ACME_CERT_PATH" ] || [ ! -s "$ACME_KEY_PATH" ]; then
+        log_error "证书文件不完整: $ACME_CERT_PATH / $ACME_KEY_PATH"
+        return 1
+    fi
+    chmod 600 "$ACME_KEY_PATH"
+    log_info "证书已安装 (fullchain): $ACME_CERT_PATH"
+}
+
+# 证书模式 (自签 / Let's Encrypt) 共用的 config.json 写入
+# 依赖调用方已设置: TAG_JSON PORT PASSWORD MASQ_DOMAIN ANYTLS_CERT ANYTLS_KEY
+_anytls_write_cert_config() {
+    cat > "$SINGBOX_CONFIG" <<EOF
+{
+  "log": {
+    "level": "error",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "anytls",
+      "tag": "${TAG_JSON}",
+      "listen": "::",
+      "listen_port": ${PORT},
+      "users": [
+        {
+          "name": "user1",
+          "password": "${PASSWORD}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${MASQ_DOMAIN}",
+        "certificate_path": "${ANYTLS_CERT}",
+        "key_path": "${ANYTLS_KEY}"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+}
+
+singbox_configure_anytls() {
+    printf "${BLUE}=== Sing-Box 配置: AnyTLS ===${NC}\n"
+    if ! command -v sing-box >/dev/null 2>&1; then
+        log_error "Sing-Box 未安装, 请先执行: 4 -> 1 安装"
+        return 1
+    fi
+
+    read_input "节点 TAG" "MyAnyTLS" NODE_TAG
+    read_input "监听端口" "8443" PORT
+    case "$PORT" in
+        ''|*[!0-9]*) log_error "端口必须是数字"; return 1 ;;
+    esac
+
+    printf "  ${CYAN}TLS 模式:${NC}\n"
+    printf "    ${CYAN}1)${NC} Reality          (无需证书/域名, 客户端需支持 AnyTLS + Reality)\n"
+    printf "    ${CYAN}2)${NC} 自签证书         (无需域名, 客户端需开启 insecure)\n"
+    printf "    ${CYAN}3)${NC} Let's Encrypt    (需自有域名, 客户端无需 insecure)\n"
+    printf "  ${CYAN}选择 [1/2/3] ${GRAY}[默认: 1]${NC}${CYAN} > ${NC}"
+    key_read
+    case "$KEY" in
+        3)      printf "3\n"; TLS_MODE="acme" ;;
+        2)      printf "2\n"; TLS_MODE="cert" ;;
+        1|'')   printf "1\n"; TLS_MODE="reality" ;;
+        *)      printf "\n"; log_error "无效选择"; return 1 ;;
+    esac
+
+    if [ "$TLS_MODE" = "cert" ]; then
+        CERT_CN_DEFAULT="$IP_CACHE"
+        [ -z "$CERT_CN_DEFAULT" ] && CERT_CN_DEFAULT=$(get_server_ip)
+        [ -z "$CERT_CN_DEFAULT" ] && CERT_CN_DEFAULT="127.0.0.1"
+        read_input "证书 CN / 客户端 SNI (默认服务器 IP, 也可填域名)" "$CERT_CN_DEFAULT" MASQ_DOMAIN
+        case "$MASQ_DOMAIN" in
+            ''|*[!A-Za-z0-9.:-]*) log_error "CN 格式无效 (仅允许字母/数字/. : -)"; return 1 ;;
+        esac
+    elif [ "$TLS_MODE" = "acme" ]; then
+        read_input "你的域名 (客户端 SNI 用它)" "" MASQ_DOMAIN
+        case "$MASQ_DOMAIN" in
+            ''|*[!A-Za-z0-9.-]*) log_error "域名格式无效"; return 1 ;;
+            *.*) : ;;
+            *) log_error "请填写完整域名 (如 proxy.example.com)"; return 1 ;;
+        esac
+        # 证书申请要交互输入, 必须放在下面的子 shell 之外
+        acme_issue_cert "$MASQ_DOMAIN" || return 1
+    fi
+
+    (
+        set -e
+        PASSWORD=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-24)
+        TAG_JSON=$(json_escape "$NODE_TAG")
+
+        mkdir -p "$SINGBOX_DIR"
+        [ -f "$SINGBOX_CONFIG" ] && cp "$SINGBOX_CONFIG" "${SINGBOX_CONFIG}.bak.$(date +%s)"
+
+        if [ "$TLS_MODE" = "reality" ]; then
+            get_best_domain
+            MASQ_DOMAIN="$BEST_DOMAIN"
+            pair_out=$(sing-box generate reality-keypair)
+            PRIV_KEY=$(echo "$pair_out" | grep "PrivateKey" | awk '{print $2}')
+            PUB_KEY=$(echo "$pair_out" | grep "PublicKey" | awk '{print $2}')
+            SHORT_ID=$(openssl rand -hex 8)
+
+            cat > "$SINGBOX_CONFIG" <<EOF
+{
+  "log": {
+    "level": "error",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "anytls",
+      "tag": "${TAG_JSON}",
+      "listen": "::",
+      "listen_port": ${PORT},
+      "users": [
+        {
+          "name": "user1",
+          "password": "${PASSWORD}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${MASQ_DOMAIN}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${MASQ_DOMAIN}",
+            "server_port": 443
+          },
+          "private_key": "${PRIV_KEY}",
+          "short_id": [
+            "${SHORT_ID}"
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+        elif [ "$TLS_MODE" = "acme" ]; then
+            ANYTLS_CERT="$ACME_CERT_PATH"
+            ANYTLS_KEY="$ACME_KEY_PATH"
+            log_info "使用 Let's Encrypt 证书: $ANYTLS_CERT"
+            _anytls_write_cert_config
+        else
+            ANYTLS_CERT="${SINGBOX_DIR}/anytls.crt"
+            ANYTLS_KEY="${SINGBOX_DIR}/anytls.key"
+            # CN 是 IP 时 SAN 必须用 IP: 类型, 否则客户端按域名校验会找不到匹配项
+            SAN_TYPE="DNS"
+            case "$MASQ_DOMAIN" in
+                *:*) SAN_TYPE="IP" ;;
+                *)   if validate_ipv4 "$MASQ_DOMAIN"; then SAN_TYPE="IP"; fi ;;
+            esac
+            log_info "生成自签证书 (CN=${MASQ_DOMAIN}, SAN=${SAN_TYPE}:${MASQ_DOMAIN}, 有效期 100 年)..."
+            openssl ecparam -genkey -name prime256v1 -out "$ANYTLS_KEY" 2>/dev/null
+            # -addext 需要 openssl >= 1.1.1, 老版本回退到 -extfile
+            if ! openssl req -new -x509 -days 36500 -key "$ANYTLS_KEY" -out "$ANYTLS_CERT" \
+                    -subj "/CN=${MASQ_DOMAIN}" \
+                    -addext "subjectAltName = ${SAN_TYPE}:${MASQ_DOMAIN}" 2>/dev/null; then
+                EXT_FILE=$(mktemp)
+                printf 'subjectAltName = %s:%s\n' "$SAN_TYPE" "$MASQ_DOMAIN" > "$EXT_FILE"
+                openssl req -new -x509 -days 36500 -key "$ANYTLS_KEY" -out "$ANYTLS_CERT" \
+                    -subj "/CN=${MASQ_DOMAIN}" -extfile "$EXT_FILE" 2>/dev/null || true
+                rm -f "$EXT_FILE"
+            fi
+            if [ ! -s "$ANYTLS_CERT" ] || [ ! -s "$ANYTLS_KEY" ]; then
+                log_error "自签证书生成失败, 请检查 openssl"
+                exit 1
+            fi
+            chmod 600 "$ANYTLS_KEY"
+
+            _anytls_write_cert_config
+        fi
+
+        singbox_restart
+
+        SERVER_IP=$(get_server_ip)
+        [ -z "$SERVER_IP" ] && SERVER_IP="[无法获取IP]"
+        TAG_ENCODED=$(echo "$NODE_TAG" | sed 's/ /%20/g')
+
+        printf "\n${BLUE}========================================================${NC}\n"
+        printf "📋 节点信息 (Tag: ${NODE_TAG})  类型: ${CYAN}AnyTLS${NC}\n"
+        printf "${BLUE}========================================================${NC}\n"
+        if [ "$TLS_MODE" = "reality" ]; then
+            ANYTLS_LINK="anytls://${PASSWORD}@${SERVER_IP}:${PORT}?sni=${MASQ_DOMAIN}&security=reality&fp=chrome&pbk=${PUB_KEY}&sid=${SHORT_ID}&type=tcp#${TAG_ENCODED}"
+            printf "${CYAN}🚀 AnyTLS 链接 (Reality):${NC}\n%s\n\n" "$ANYTLS_LINK"
+            printf "${CYAN}📄 JSON 客户端配置:${NC}\n"
+            cat <<EOF
+{
+    "tag": "${NODE_TAG}",
+    "type": "anytls",
+    "server": "${SERVER_IP}",
+    "server_port": ${PORT},
+    "password": "${PASSWORD}",
+    "tls": {
+        "enabled": true,
+        "server_name": "${MASQ_DOMAIN}",
+        "utls": {
+            "enabled": true,
+            "fingerprint": "chrome"
+        },
+        "reality": {
+            "enabled": true,
+            "public_key": "${PUB_KEY}",
+            "short_id": "${SHORT_ID}"
+        }
+    }
+}
+EOF
+        elif [ "$TLS_MODE" = "acme" ]; then
+            # 正式证书: 客户端按域名连 (证书是拿 SNI 校验的), 不需要 insecure
+            ANYTLS_LINK="anytls://${PASSWORD}@${MASQ_DOMAIN}:${PORT}?sni=${MASQ_DOMAIN}&security=tls&type=tcp#${TAG_ENCODED}"
+            printf "${CYAN}🚀 AnyTLS 链接 (Let's Encrypt):${NC}\n%s\n\n" "$ANYTLS_LINK"
+            printf "${GRAY}提示: 若走 realm 中转, 把 server 改成中转机 IP, server_name 保持域名不变${NC}\n\n"
+            printf "${CYAN}📄 JSON 客户端配置:${NC}\n"
+            cat <<EOF
+{
+    "tag": "${NODE_TAG}",
+    "type": "anytls",
+    "server": "${MASQ_DOMAIN}",
+    "server_port": ${PORT},
+    "password": "${PASSWORD}",
+    "tls": {
+        "enabled": true,
+        "server_name": "${MASQ_DOMAIN}",
+        "utls": {
+            "enabled": true,
+            "fingerprint": "chrome"
+        }
+    }
+}
+EOF
+        else
+            ANYTLS_LINK="anytls://${PASSWORD}@${SERVER_IP}:${PORT}?sni=${MASQ_DOMAIN}&security=tls&type=tcp&insecure=1#${TAG_ENCODED}"
+            printf "${CYAN}🚀 AnyTLS 链接 (自签证书):${NC}\n%s\n\n" "$ANYTLS_LINK"
+            printf "${YELLOW}⚠ 自签证书: 客户端必须开启 '跳过证书验证 / insecure'${NC}\n\n"
+            printf "${CYAN}📄 JSON 客户端配置:${NC}\n"
+            cat <<EOF
+{
+    "tag": "${NODE_TAG}",
+    "type": "anytls",
+    "server": "${SERVER_IP}",
+    "server_port": ${PORT},
+    "password": "${PASSWORD}",
+    "tls": {
+        "enabled": true,
+        "server_name": "${MASQ_DOMAIN}",
+        "insecure": true,
+        "utls": {
+            "enabled": true,
+            "fingerprint": "chrome"
+        }
+    }
+}
+EOF
+        fi
         printf "${BLUE}========================================================${NC}\n"
     )
 }
@@ -4046,12 +4535,14 @@ singbox_items() {
     if [ ! -f "$SINGBOX_CONFIG" ]; then
         printf '%s\n' "1|配置 Shadowsocks-2022|singbox_configure_ss2022|act"
         printf '%s\n' "2|配置 VLESS + Reality|singbox_configure_vless_reality|act"
+        printf '%s\n' "3|配置 AnyTLS|singbox_configure_anytls|act"
     else
         printf '%s\n' "1|查看代理链接|singbox_view_link|act"
         printf '%s\n' "2|重启代理|singbox_restart_proxy|act"
         printf '%s\n' "3|重新配置 Shadowsocks-2022|singbox_configure_ss2022|act"
         printf '%s\n' "4|重新配置 VLESS + Reality|singbox_configure_vless_reality|act"
-        printf '%s\n' "5|删除代理配置|singbox_delete_proxy|act"
+        printf '%s\n' "5|重新配置 AnyTLS|singbox_configure_anytls|act"
+        printf '%s\n' "6|删除代理配置|singbox_delete_proxy|act"
     fi
     printf '%s\n' "x|卸载 Sing-Box|singbox_uninstall|act"
 }
