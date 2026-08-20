@@ -1273,6 +1273,40 @@ acme_warn_firewall() {
     log_warn "   建议改用 DNS-01, 或先临时关闭防火墙 (5 -> 关闭防火墙)"
 }
 
+# Token 打码显示: 头4位 + **** + 尾4位
+acme_mask_token() {
+    _t="$1"
+    if [ "${#_t}" -le 8 ]; then
+        printf '********'
+    else
+        printf '%s****%s' \
+            "$(printf '%s' "$_t" | cut -c1-4)" \
+            "$(printf '%s' "$_t" | sed 's/.*\(....\)$/\1/')"
+    fi
+}
+
+# 按优先级查找已保存的 Cloudflare Token, 设置 CF_TOKEN_VALUE / CF_TOKEN_SRC
+#   1) DDNS 模块保存的 /root/.cf_token
+#   2) acme.sh 上次签发时自己存进 account.conf 的 SAVED_CF_Token
+acme_load_cf_token() {
+    CF_TOKEN_VALUE=""
+    CF_TOKEN_SRC=""
+    if [ -s "$DDNS_TOKEN_FILE" ]; then
+        CF_TOKEN_VALUE=$(cat "$DDNS_TOKEN_FILE")
+        CF_TOKEN_SRC="DDNS 模块 ($DDNS_TOKEN_FILE)"
+        [ -n "$CF_TOKEN_VALUE" ] && return 0
+    fi
+    if [ -f "${ACME_HOME}/account.conf" ]; then
+        CF_TOKEN_VALUE=$(grep "^SAVED_CF_Token=" "${ACME_HOME}/account.conf" 2>/dev/null \
+            | tail -n 1 | cut -d"'" -f2)
+        if [ -n "$CF_TOKEN_VALUE" ]; then
+            CF_TOKEN_SRC="acme.sh 上次保存"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 # 续期后要重载哪个服务 (装了 sing-box 就重启它, 否则留空)
 acme_default_reloadcmd() {
     if command -v sing-box >/dev/null 2>&1; then
@@ -1303,8 +1337,9 @@ acme_issue_cert() {
     acme_installed || { acme_install || return 1; }
 
     printf "  ${CYAN}域名验证方式:${NC}\n"
-    if [ -f "$DDNS_TOKEN_FILE" ]; then
-        printf "    ${CYAN}1)${NC} DNS-01 (Cloudflare, 复用 DDNS 已保存的 Token)  ${GREEN}[推荐]${NC}\n"
+    if acme_load_cf_token; then
+        printf "    ${CYAN}1)${NC} DNS-01 (Cloudflare, 已有 Token: %s)  ${GREEN}[推荐]${NC}\n" \
+            "$(acme_mask_token "$CF_TOKEN_VALUE")"
     else
         printf "    ${CYAN}1)${NC} DNS-01 (Cloudflare, 需输入 API Token)  ${GREEN}[推荐]${NC}\n"
     fi
@@ -1318,16 +1353,22 @@ acme_issue_cert() {
     esac
 
     if [ "$_method" = "dns" ]; then
-        if [ -f "$DDNS_TOKEN_FILE" ]; then
-            CF_Token=$(cat "$DDNS_TOKEN_FILE")
-            log_info "复用 DDNS 模块保存的 Cloudflare Token"
-        else
+        CF_Token=""
+        if acme_load_cf_token; then
+            log_info "找到已保存的 Cloudflare Token (来源: ${CF_TOKEN_SRC})"
+            printf "  ${GRAY}Token: %s${NC}\n" "$(acme_mask_token "$CF_TOKEN_VALUE")"
+            if confirm "使用该 Token?" y; then
+                CF_Token="$CF_TOKEN_VALUE"
+            fi
+        fi
+        if [ -z "$CF_Token" ]; then
             read_input "Cloudflare API Token (Zone:DNS:Edit 权限)" "" CF_Token
         fi
         if [ -z "$CF_Token" ]; then
             log_error "Token 为空"
             return 1
         fi
+        # acme.sh 会把它存进 account.conf 的 SAVED_CF_Token, 下次自动复用
         export CF_Token
         log_info "通过 DNS-01 申请证书 (域名: $_domain)..."
         "$ACME_BIN" --issue -d "$_domain" --dns dns_cf -k ec-256 || \
