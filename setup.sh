@@ -11,6 +11,7 @@
 #   1 安装常用软件      2 NTP 时间同步     3 Fail2Ban
 #   4 Sing-Box (SS2022/VLESS-Reality/AnyTLS+ACME)  5 防火墙(nftables)  6 TCP 调优(BBR)
 #   7 Realm 转发        8 Cloudflare DDNS  9 SSH 配置
+#   c ACME 证书 (Let's Encrypt, 独立模块, 任何服务都可引用)
 #   d 系统重装 (DD)
 # 用法: sudo sh setup.sh
 # ================================================================
@@ -34,7 +35,7 @@ log_error() { printf "${RED}[ERROR]${NC} %s\n" "$1"; }
 # --- 全局常量 ---
 SINGBOX_CONFIG="/etc/sing-box/config.json"
 SINGBOX_DIR="/etc/sing-box"
-SINGBOX_CERT_DIR="/etc/sing-box/certs"
+ACME_CERT_DIR="/etc/ssl/acme"
 NFT_CONF="/etc/nftables.conf"
 NFT_TABLE="landing_whitelist"
 NFT_WL_FILE="/etc/landing_whitelist.conf"
@@ -1156,6 +1157,305 @@ fail2ban_unban() {
 }
 
 # ================================================================
+# ACME (Let's Encrypt) 证书模块  —— 独立于 Sing-Box
+#   证书统一放在 $ACME_CERT_DIR/<domain>.{crt,key}
+#   任何服务 (sing-box / nginx / 自建程序) 都可以直接引用这两个文件
+#   续期由 acme.sh 自带 cron 完成, --reloadcmd 负责重载使用方
+# ================================================================
+ACME_HOME="/root/.acme.sh"
+ACME_BIN="/root/.acme.sh/acme.sh"
+
+acme_installed() { [ -x "$ACME_BIN" ]; }
+
+# 已签发并安装到 $ACME_CERT_DIR 的域名, 每行一个
+acme_list_domains() {
+    [ -d "$ACME_CERT_DIR" ] || return 0
+    for _crt in "$ACME_CERT_DIR"/*.crt; do
+        [ -f "$_crt" ] || continue
+        _d=$(basename "$_crt" .crt)
+        [ -f "${ACME_CERT_DIR}/${_d}.key" ] || continue
+        printf '%s\n' "$_d"
+    done
+}
+
+# 证书表格: 域名 / 到期时间 / 状态
+acme_list_certs() {
+    _n=0
+    acme_list_domains | while IFS= read -r _d; do
+        _n=$((_n + 1))
+        _crt="${ACME_CERT_DIR}/${_d}.crt"
+        _end=$(openssl x509 -in "$_crt" -noout -enddate 2>/dev/null | cut -d= -f2)
+        # -checkend 比解析日期可移植: 各发行版的 date -d 行为不一致
+        if ! openssl x509 -in "$_crt" -noout -checkend 0 >/dev/null 2>&1; then
+            _st="${RED}已过期${NC}"
+        elif ! openssl x509 -in "$_crt" -noout -checkend 604800 >/dev/null 2>&1; then
+            _st="${YELLOW}7天内到期${NC}"
+        else
+            _st="${GREEN}有效${NC}"
+        fi
+        printf "  ${CYAN}%-2s${NC} %-32s %-26s ${_st}\n" "$_n)" "$_d" "${_end:-未知}"
+    done
+}
+
+acme_status() {
+    printf "${MAGENTA}--- ACME 证书 ---${NC}\n"
+    if acme_installed; then
+        _ver=$("$ACME_BIN" --version 2>/dev/null | grep -i 'v[0-9]' | head -n 1)
+        printf "  acme.sh:  ${GREEN}已安装${NC}  ${CYAN}%s${NC}\n" "${_ver:-}"
+        _ca=$(grep '^DEFAULT_ACME_SERVER=' "${ACME_HOME}/account.conf" 2>/dev/null | cut -d"'" -f2)
+        [ -n "$_ca" ] && printf "  默认 CA:  ${CYAN}%s${NC}\n" "$_ca"
+        if acme_cron_enabled; then
+            printf "  自动续期: ${GREEN}● 已启用${NC}\n"
+        else
+            printf "  自动续期: ${YELLOW}○ 未启用${NC}\n"
+        fi
+    else
+        printf "  acme.sh:  ${RED}未安装${NC}\n"
+    fi
+    _cnt=$(acme_list_domains | grep -c .)
+    printf "  已装证书: ${CYAN}%s${NC} 个  ${GRAY}(%s)${NC}\n" "$_cnt" "$ACME_CERT_DIR"
+    if [ "$_cnt" -gt 0 ]; then
+        acme_list_certs
+    fi
+    printf "${MAGENTA}-----------------${NC}\n"
+}
+
+acme_cron_enabled() {
+    crontab -l 2>/dev/null | grep -q "acme.sh --cron"
+}
+
+acme_install() {
+    printf "${BLUE}=== 安装 acme.sh ===${NC}\n"
+    if acme_installed; then
+        log_warn "acme.sh 已安装于 $ACME_BIN, 跳过"
+        return 0
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        pkg_update >/dev/null 2>&1 || true
+        pkg_install curl >/dev/null 2>&1
+    fi
+    # acme.sh 需要 cron 才能自动续期
+    if ! command -v crontab >/dev/null 2>&1; then
+        pkg_install cronie >/dev/null 2>&1 || pkg_install cron >/dev/null 2>&1 || \
+            log_warn "未能安装 cron, 自动续期可能不可用"
+    fi
+    read_input "注册邮箱 (用于 CA 到期提醒)" "admin@example.com" ACME_EMAIL
+    log_info "安装中..."
+    curl -fsSL https://get.acme.sh | sh -s "email=${ACME_EMAIL}" >/dev/null 2>&1
+    if ! acme_installed; then
+        log_error "acme.sh 安装失败"
+        return 1
+    fi
+    # 新版 acme.sh 默认 CA 是 ZeroSSL, 需要注册账号; 统一切到 Let's Encrypt
+    "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1
+    mkdir -p "$ACME_CERT_DIR"
+    log_info "acme.sh 安装完成, 默认 CA 已设为 Let's Encrypt"
+}
+
+acme_uninstall() {
+    printf "${BLUE}=== 卸载 acme.sh ===${NC}\n"
+    if ! acme_installed; then
+        log_warn "acme.sh 未安装, 无需卸载"
+        return 0
+    fi
+    confirm "确认卸载 acme.sh? (已签发的证书文件会保留)" || { log_warn "已取消"; return 0; }
+    "$ACME_BIN" --uninstall >/dev/null 2>&1 || true
+    rm -rf "$ACME_HOME"
+    log_info "acme.sh 已卸载"
+    log_warn "证书文件仍在 $ACME_CERT_DIR, 如需清理请手动删除"
+}
+
+# 白名单防火墙开启时, LE 验证机的 IP 不在 set 里, 80 端口对它不可达
+acme_warn_firewall() {
+    nft_table_exists || return 0
+    log_warn "⚠️ 检测到白名单防火墙已启用 (input policy drop)"
+    log_warn "   Let's Encrypt 验证机的 IP 不在白名单中, HTTP-01 将无法通过"
+    log_warn "   建议改用 DNS-01, 或先临时关闭防火墙 (5 -> 关闭防火墙)"
+}
+
+# 续期后要重载哪个服务 (装了 sing-box 就重启它, 否则留空)
+acme_default_reloadcmd() {
+    if command -v sing-box >/dev/null 2>&1; then
+        printf '%s' "systemctl restart sing-box"
+    else
+        printf '%s' "true"
+    fi
+}
+
+# acme_issue_cert <domain> [reloadcmd]
+# 成功后设置: ACME_CERT_PATH / ACME_KEY_PATH
+acme_issue_cert() {
+    _domain="$1"
+    _reload="${2:-$(acme_default_reloadcmd)}"
+    [ -z "$_domain" ] && { log_error "域名为空"; return 1; }
+
+    mkdir -p "$ACME_CERT_DIR"
+    ACME_CERT_PATH="${ACME_CERT_DIR}/${_domain}.crt"
+    ACME_KEY_PATH="${ACME_CERT_DIR}/${_domain}.key"
+
+    if [ -s "$ACME_CERT_PATH" ] && [ -s "$ACME_KEY_PATH" ]; then
+        log_info "检测到已有证书: $ACME_CERT_PATH"
+        if confirm "直接复用该证书?" y; then
+            return 0
+        fi
+    fi
+
+    acme_installed || { acme_install || return 1; }
+
+    printf "  ${CYAN}域名验证方式:${NC}\n"
+    if [ -f "$DDNS_TOKEN_FILE" ]; then
+        printf "    ${CYAN}1)${NC} DNS-01 (Cloudflare, 复用 DDNS 已保存的 Token)  ${GREEN}[推荐]${NC}\n"
+    else
+        printf "    ${CYAN}1)${NC} DNS-01 (Cloudflare, 需输入 API Token)  ${GREEN}[推荐]${NC}\n"
+    fi
+    printf "    ${CYAN}2)${NC} HTTP-01 standalone (需 80 端口对外可达)\n"
+    printf "  ${CYAN}选择 [1/2] ${GRAY}[默认: 1]${NC}${CYAN} > ${NC}"
+    key_read
+    case "$KEY" in
+        2)      printf "2\n"; _method="http" ;;
+        1|'')   printf "1\n"; _method="dns" ;;
+        *)      printf "\n"; log_error "无效选择"; return 1 ;;
+    esac
+
+    if [ "$_method" = "dns" ]; then
+        if [ -f "$DDNS_TOKEN_FILE" ]; then
+            CF_Token=$(cat "$DDNS_TOKEN_FILE")
+            log_info "复用 DDNS 模块保存的 Cloudflare Token"
+        else
+            read_input "Cloudflare API Token (Zone:DNS:Edit 权限)" "" CF_Token
+        fi
+        if [ -z "$CF_Token" ]; then
+            log_error "Token 为空"
+            return 1
+        fi
+        export CF_Token
+        log_info "通过 DNS-01 申请证书 (域名: $_domain)..."
+        "$ACME_BIN" --issue -d "$_domain" --dns dns_cf -k ec-256 || \
+            log_warn "签发未成功, 尝试安装 acme.sh 中已有的证书..."
+    else
+        acme_warn_firewall
+        if ! command -v socat >/dev/null 2>&1; then
+            log_info "安装 socat (standalone 模式依赖)..."
+            pkg_update >/dev/null 2>&1 || true
+            pkg_install socat >/dev/null 2>&1 || log_warn "socat 安装失败, standalone 可能不可用"
+        fi
+        if ss -lnt 2>/dev/null | grep -q ':80[[:space:]]'; then
+            log_warn "80 端口已被占用, 请先停掉占用进程"
+            return 1
+        fi
+        log_info "通过 HTTP-01 standalone 申请证书 (域名: $_domain)..."
+        "$ACME_BIN" --issue -d "$_domain" --standalone --httpport 80 -k ec-256 || \
+            log_warn "签发未成功, 尝试安装 acme.sh 中已有的证书..."
+    fi
+
+    # --ecc 对应 -k ec-256; reloadcmd 保证续期后使用方重新加载证书
+    if ! "$ACME_BIN" --install-cert -d "$_domain" --ecc \
+            --fullchain-file "$ACME_CERT_PATH" \
+            --key-file "$ACME_KEY_PATH" \
+            --reloadcmd "$_reload"; then
+        log_error "证书安装失败, 请确认: ① 域名已解析到本机 ② 验证方式可用 ③ acme.sh 中已有该域名证书"
+        return 1
+    fi
+    if [ ! -s "$ACME_CERT_PATH" ] || [ ! -s "$ACME_KEY_PATH" ]; then
+        log_error "证书文件不完整: $ACME_CERT_PATH / $ACME_KEY_PATH"
+        return 1
+    fi
+    chmod 600 "$ACME_KEY_PATH"
+    log_info "证书已安装 (fullchain): $ACME_CERT_PATH"
+    log_info "私钥: $ACME_KEY_PATH   续期后执行: $_reload"
+}
+
+# --- 菜单动作 ---
+acme_issue_interactive() {
+    printf "${BLUE}=== 申请证书 ===${NC}\n"
+    read_input "域名 (如 proxy.example.com)" "" _d
+    case "$_d" in
+        ''|*[!A-Za-z0-9.-]*) log_error "域名格式无效"; return 1 ;;
+        *.*) : ;;
+        *) log_error "请填写完整域名"; return 1 ;;
+    esac
+    acme_issue_cert "$_d"
+}
+
+acme_renew() {
+    printf "${BLUE}=== 强制续期 ===${NC}\n"
+    acme_installed || { log_error "acme.sh 未安装"; return 1; }
+    _cnt=$(acme_list_domains | grep -c .)
+    if [ "$_cnt" -eq 0 ]; then
+        log_warn "还没有已安装的证书"
+        return 0
+    fi
+    acme_list_certs
+    read_input "选择编号 (回车全部续期)" "" _sel
+    if [ -z "$_sel" ]; then
+        log_info "续期全部证书..."
+        "$ACME_BIN" --cron --force
+    else
+        _d=$(acme_list_domains | sed -n "${_sel}p")
+        [ -z "$_d" ] && { log_error "编号无效"; return 1; }
+        log_info "续期 $_d ..."
+        "$ACME_BIN" --renew -d "$_d" --ecc --force
+    fi
+    log_info "续期完成 (证书文件已由 --install-cert 的 reloadcmd 自动更新)"
+}
+
+acme_delete() {
+    printf "${BLUE}=== 删除证书 ===${NC}\n"
+    _cnt=$(acme_list_domains | grep -c .)
+    if [ "$_cnt" -eq 0 ]; then
+        log_warn "没有可删除的证书"
+        return 0
+    fi
+    acme_list_certs
+    read_input "选择要删除的编号" "" _sel
+    _d=$(acme_list_domains | sed -n "${_sel}p")
+    [ -z "$_d" ] && { log_error "编号无效"; return 1; }
+    confirm "确认删除 ${_d} 的证书?" || { log_warn "已取消"; return 0; }
+    acme_installed && "$ACME_BIN" --remove -d "$_d" --ecc >/dev/null 2>&1
+    rm -f "${ACME_CERT_DIR}/${_d}.crt" "${ACME_CERT_DIR}/${_d}.key"
+    log_info "已删除 $_d 的证书"
+    log_warn "注意: 引用了该证书的服务需要另行调整配置"
+}
+
+# 让用户从已有证书里选一个 (供 sing-box 等复用)
+# 成功后设置: SELECTED_CERT_DOMAIN / SELECTED_CERT_CRT / SELECTED_CERT_KEY
+# 选 n 表示申请新证书; 没有任何证书时直接进申请流程
+acme_select_cert() {
+    SELECTED_CERT_DOMAIN=""; SELECTED_CERT_CRT=""; SELECTED_CERT_KEY=""
+    _cnt=$(acme_list_domains | grep -c .)
+
+    if [ "$_cnt" -eq 0 ]; then
+        log_info "还没有已签发的证书, 进入申请流程"
+        acme_issue_interactive || return 1
+        SELECTED_CERT_DOMAIN=$(basename "$ACME_CERT_PATH" .crt)
+        SELECTED_CERT_CRT="$ACME_CERT_PATH"
+        SELECTED_CERT_KEY="$ACME_KEY_PATH"
+        return 0
+    fi
+
+    printf "  ${CYAN}选择证书:${NC}\n"
+    acme_list_certs
+    printf "    ${CYAN}n)${NC} 申请新证书\n"
+    read_input "选择编号或 n" "1" _sel
+    if [ "$_sel" = "n" ] || [ "$_sel" = "N" ]; then
+        acme_issue_interactive || return 1
+        SELECTED_CERT_DOMAIN=$(basename "$ACME_CERT_PATH" .crt)
+        SELECTED_CERT_CRT="$ACME_CERT_PATH"
+        SELECTED_CERT_KEY="$ACME_KEY_PATH"
+        return 0
+    fi
+    _d=$(acme_list_domains | sed -n "${_sel}p")
+    if [ -z "$_d" ]; then
+        log_error "编号无效"
+        return 1
+    fi
+    SELECTED_CERT_DOMAIN="$_d"
+    SELECTED_CERT_CRT="${ACME_CERT_DIR}/${_d}.crt"
+    SELECTED_CERT_KEY="${ACME_CERT_DIR}/${_d}.key"
+    log_info "已选择证书: $_d"
+}
+
+# ================================================================
 # Sing-Box 模块
 # ================================================================
 singbox_status() {
@@ -1725,121 +2025,6 @@ EOF
     )
 }
 
-# ================================================================
-# ACME (Let's Encrypt) 证书模块
-#   为 sing-box 申请正式证书, 装到 $SINGBOX_CERT_DIR/<domain>.{crt,key}
-#   续期由 acme.sh 自带 cron 完成, --reloadcmd 负责重启 sing-box
-# ================================================================
-ACME_BIN="/root/.acme.sh/acme.sh"
-
-acme_ensure_installed() {
-    [ -x "$ACME_BIN" ] && return 0
-    log_info "安装 acme.sh..."
-    if ! command -v curl >/dev/null 2>&1; then
-        pkg_update >/dev/null 2>&1 || true
-        pkg_install curl >/dev/null 2>&1
-    fi
-    curl -fsSL https://get.acme.sh | sh -s "email=admin@${1:-example.com}" >/dev/null 2>&1
-    if [ ! -x "$ACME_BIN" ]; then
-        log_error "acme.sh 安装失败"
-        return 1
-    fi
-    # 默认 CA 换成 Let's Encrypt (acme.sh 新版默认是 ZeroSSL, 需要注册账号)
-    "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1
-    log_info "acme.sh 安装完成"
-}
-
-# 白名单防火墙开启时, LE 验证机的 IP 不在 set 里, 80 端口对它不可达
-acme_warn_firewall() {
-    nft_table_exists || return 0
-    log_warn "⚠️ 检测到白名单防火墙已启用 (input policy drop)"
-    log_warn "   Let's Encrypt 验证机的 IP 不在白名单中, HTTP-01 将无法通过"
-    log_warn "   建议改用 DNS-01, 或先临时关闭防火墙 (5 -> 关闭防火墙)"
-}
-
-# acme_issue_cert <domain>
-# 成功后设置: ACME_CERT_PATH / ACME_KEY_PATH
-acme_issue_cert() {
-    _domain="$1"
-    [ -z "$_domain" ] && { log_error "域名为空"; return 1; }
-
-    mkdir -p "$SINGBOX_CERT_DIR"
-    ACME_CERT_PATH="${SINGBOX_CERT_DIR}/${_domain}.crt"
-    ACME_KEY_PATH="${SINGBOX_CERT_DIR}/${_domain}.key"
-
-    if [ -s "$ACME_CERT_PATH" ] && [ -s "$ACME_KEY_PATH" ]; then
-        log_info "检测到已有证书: $ACME_CERT_PATH"
-        if confirm "直接复用该证书?" y; then
-            return 0
-        fi
-    fi
-
-    acme_ensure_installed "$_domain" || return 1
-
-    printf "  ${CYAN}域名验证方式:${NC}\n"
-    if [ -f "$DDNS_TOKEN_FILE" ]; then
-        printf "    ${CYAN}1)${NC} DNS-01 (Cloudflare, 复用 DDNS 已保存的 Token)  ${GREEN}[推荐]${NC}\n"
-    else
-        printf "    ${CYAN}1)${NC} DNS-01 (Cloudflare, 需输入 API Token)  ${GREEN}[推荐]${NC}\n"
-    fi
-    printf "    ${CYAN}2)${NC} HTTP-01 standalone (需 80 端口对外可达)\n"
-    printf "  ${CYAN}选择 [1/2] ${GRAY}[默认: 1]${NC}${CYAN} > ${NC}"
-    key_read
-    case "$KEY" in
-        2)      printf "2\n"; _method="http" ;;
-        1|'')   printf "1\n"; _method="dns" ;;
-        *)      printf "\n"; log_error "无效选择"; return 1 ;;
-    esac
-
-    if [ "$_method" = "dns" ]; then
-        if [ -f "$DDNS_TOKEN_FILE" ]; then
-            CF_Token=$(cat "$DDNS_TOKEN_FILE")
-            log_info "复用 DDNS 模块保存的 Cloudflare Token"
-        else
-            read_input "Cloudflare API Token (Zone:DNS:Edit 权限)" "" CF_Token
-        fi
-        if [ -z "$CF_Token" ]; then
-            log_error "Token 为空"
-            return 1
-        fi
-        export CF_Token
-        log_info "通过 DNS-01 申请证书 (域名: $_domain)..."
-        "$ACME_BIN" --issue -d "$_domain" --dns dns_cf -k ec-256 || \
-            log_warn "签发未成功, 尝试安装 acme.sh 中已有的证书..."
-    else
-        acme_warn_firewall
-        if ! command -v socat >/dev/null 2>&1; then
-            log_info "安装 socat (standalone 模式依赖)..."
-            pkg_update >/dev/null 2>&1 || true
-            pkg_install socat >/dev/null 2>&1 || log_warn "socat 安装失败, standalone 可能不可用"
-        fi
-        if ss -lnt 2>/dev/null | grep -q ':80[[:space:]]'; then
-            log_warn "80 端口已被占用, 请先停掉占用进程"
-            return 1
-        fi
-        log_info "通过 HTTP-01 standalone 申请证书 (域名: $_domain)..."
-        "$ACME_BIN" --issue -d "$_domain" --standalone --httpport 80 -k ec-256 || \
-            log_warn "签发未成功, 尝试安装 acme.sh 中已有的证书..."
-    fi
-
-    # --ecc 对应 -k ec-256; reloadcmd 保证续期后 sing-box 重新加载证书
-    if ! "$ACME_BIN" --install-cert -d "$_domain" --ecc \
-            --fullchain-file "$ACME_CERT_PATH" \
-            --key-file "$ACME_KEY_PATH" \
-            --reloadcmd "systemctl restart sing-box"; then
-        log_error "证书安装失败, 请确认: ① 域名已解析到本机 ② 验证方式可用 ③ acme.sh 中已有该域名证书"
-        return 1
-    fi
-    if [ ! -s "$ACME_CERT_PATH" ] || [ ! -s "$ACME_KEY_PATH" ]; then
-        log_error "证书文件不完整: $ACME_CERT_PATH / $ACME_KEY_PATH"
-        return 1
-    fi
-    chmod 600 "$ACME_KEY_PATH"
-    log_info "证书已安装 (fullchain): $ACME_CERT_PATH"
-}
-
-# 证书模式 (自签 / Let's Encrypt) 共用的 config.json 写入
-# 依赖调用方已设置: TAG_JSON PORT PASSWORD MASQ_DOMAIN ANYTLS_CERT ANYTLS_KEY
 _anytls_write_cert_config() {
     cat > "$SINGBOX_CONFIG" <<EOF
 {
@@ -1912,14 +2097,12 @@ singbox_configure_anytls() {
             ''|*[!A-Za-z0-9.:-]*) log_error "CN 格式无效 (仅允许字母/数字/. : -)"; return 1 ;;
         esac
     elif [ "$TLS_MODE" = "acme" ]; then
-        read_input "你的域名 (客户端 SNI 用它)" "" MASQ_DOMAIN
-        case "$MASQ_DOMAIN" in
-            ''|*[!A-Za-z0-9.-]*) log_error "域名格式无效"; return 1 ;;
-            *.*) : ;;
-            *) log_error "请填写完整域名 (如 proxy.example.com)"; return 1 ;;
-        esac
-        # 证书申请要交互输入, 必须放在下面的子 shell 之外
-        acme_issue_cert "$MASQ_DOMAIN" || return 1
+        # 复用证书模块: 有已签发的就直接选, 没有就走申请流程
+        # 必须放在下面的子 shell 之外, 因为要交互输入
+        acme_select_cert || return 1
+        MASQ_DOMAIN="$SELECTED_CERT_DOMAIN"
+        ACME_CERT_PATH="$SELECTED_CERT_CRT"
+        ACME_KEY_PATH="$SELECTED_CERT_KEY"
     fi
 
     (
@@ -4441,6 +4624,18 @@ brief_tcp() {
     fi
 }
 
+brief_acme() {
+    if ! acme_installed; then
+        printf '%s' "${GRAY}○ 未安装${NC}"
+        return
+    fi
+    _n=$(acme_list_domains | grep -c .)
+    if [ "$_n" -eq 0 ]; then
+        printf '%s' "${YELLOW}○ 无证书${NC}"
+    else
+        printf '%s' "${GREEN}● ${_n} 张证书${NC}"
+    fi
+}
 brief_ddns() {
     if [ ! -f "$DDNS_SCRIPT" ]; then
         printf '%s' "${GRAY}○ 未配置${NC}"
@@ -4547,6 +4742,24 @@ singbox_items() {
     printf '%s\n' "x|卸载 Sing-Box|singbox_uninstall|act"
 }
 menu_singbox() { run_menu "Sing-Box" singbox_status singbox_items; }
+
+# ================================================================
+# 子菜单: ACME 证书
+# ================================================================
+# 状态自适应: 未安装→只给安装; 已安装→申请/续期/删除
+acme_items() {
+    if ! acme_installed; then
+        printf '%s\n' "1|安装 acme.sh|acme_install|act"
+        return 0
+    fi
+    printf '%s\n' "1|申请证书|acme_issue_interactive|act"
+    if [ "$(acme_list_domains | grep -c .)" -gt 0 ]; then
+        printf '%s\n' "2|强制续期|acme_renew|act"
+        printf '%s\n' "3|删除证书|acme_delete|act"
+    fi
+    printf '%s\n' "x|卸载 acme.sh|acme_uninstall|act"
+}
+menu_acme() { run_menu "ACME 证书" acme_status acme_items; }
 
 # ================================================================
 # 子菜单: 防火墙
@@ -4683,6 +4896,7 @@ main_items() {
     printf '%s\n' "7|Realm 转发              $(brief_svc realm realm)|menu_realm|sub"
     printf '%s\n' "8|Cloudflare DDNS         $(brief_ddns)|menu_ddns|sub"
     printf '%s\n' "9|SSH 配置                $(brief_ssh)|menu_ssh|sub"
+    printf '%s\n' "c|ACME 证书               $(brief_acme)|menu_acme|sub"
     printf '%s\n' "d|${RED}系统重装 (DD) ⚠${NC}|task_system_reinstall|act"
 }
 menu_main() { run_menu "主菜单" - main_items top; }
