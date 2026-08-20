@@ -1167,13 +1167,19 @@ ACME_BIN="/root/.acme.sh/acme.sh"
 
 acme_installed() { [ -x "$ACME_BIN" ]; }
 
-# 已签发并安装到 $ACME_CERT_DIR 的域名, 每行一个
+# 一域名一目录, 文件名沿用 certbot 惯例, 方便直接套用现成的 nginx 配置:
+#   $ACME_CERT_DIR/<domain>/{fullchain.pem,privkey.pem,cert.pem,chain.pem}
+acme_dir_for() { printf '%s/%s' "$ACME_CERT_DIR" "$1"; }
+acme_crt_for() { printf '%s/%s/fullchain.pem' "$ACME_CERT_DIR" "$1"; }
+acme_key_for() { printf '%s/%s/privkey.pem' "$ACME_CERT_DIR" "$1"; }
+
+# 已签发并安装的域名, 每行一个
 acme_list_domains() {
     [ -d "$ACME_CERT_DIR" ] || return 0
-    for _crt in "$ACME_CERT_DIR"/*.crt; do
-        [ -f "$_crt" ] || continue
-        _d=$(basename "$_crt" .crt)
-        [ -f "${ACME_CERT_DIR}/${_d}.key" ] || continue
+    for _dir in "$ACME_CERT_DIR"/*/; do
+        [ -d "$_dir" ] || continue
+        _d=${_dir%/}; _d=${_d##*/}
+        [ -f "${_dir}fullchain.pem" ] && [ -f "${_dir}privkey.pem" ] || continue
         printf '%s\n' "$_d"
     done
 }
@@ -1183,7 +1189,7 @@ acme_list_certs() {
     _n=0
     acme_list_domains | while IFS= read -r _d; do
         _n=$((_n + 1))
-        _crt="${ACME_CERT_DIR}/${_d}.crt"
+        _crt=$(acme_crt_for "$_d")
         _end=$(openssl x509 -in "$_crt" -noout -enddate 2>/dev/null | cut -d= -f2)
         # -checkend 比解析日期可移植: 各发行版的 date -d 行为不一致
         if ! openssl x509 -in "$_crt" -noout -checkend 0 >/dev/null 2>&1; then
@@ -1323,9 +1329,11 @@ acme_issue_cert() {
     _reload="${2:-$(acme_default_reloadcmd)}"
     [ -z "$_domain" ] && { log_error "域名为空"; return 1; }
 
-    mkdir -p "$ACME_CERT_DIR"
-    ACME_CERT_PATH="${ACME_CERT_DIR}/${_domain}.crt"
-    ACME_KEY_PATH="${ACME_CERT_DIR}/${_domain}.key"
+    _certdir=$(acme_dir_for "$_domain")
+    mkdir -p "$_certdir"
+    chmod 700 "$_certdir"
+    ACME_CERT_PATH=$(acme_crt_for "$_domain")
+    ACME_KEY_PATH=$(acme_key_for "$_domain")
 
     if [ -s "$ACME_CERT_PATH" ] && [ -s "$ACME_KEY_PATH" ]; then
         log_info "检测到已有证书: $ACME_CERT_PATH"
@@ -1390,9 +1398,12 @@ acme_issue_cert() {
     fi
 
     # --ecc 对应 -k ec-256; reloadcmd 保证续期后使用方重新加载证书
+    # 四个文件都装上: 有的软件要 leaf 和 chain 分开, 装了不占地方
     if ! "$ACME_BIN" --install-cert -d "$_domain" --ecc \
             --fullchain-file "$ACME_CERT_PATH" \
             --key-file "$ACME_KEY_PATH" \
+            --cert-file "${_certdir}/cert.pem" \
+            --ca-file "${_certdir}/chain.pem" \
             --reloadcmd "$_reload"; then
         log_error "证书安装失败, 请确认: ① 域名已解析到本机 ② 验证方式可用 ③ acme.sh 中已有该域名证书"
         return 1
@@ -1453,7 +1464,7 @@ acme_delete() {
     [ -z "$_d" ] && { log_error "编号无效"; return 1; }
     confirm "确认删除 ${_d} 的证书?" || { log_warn "已取消"; return 0; }
     acme_installed && "$ACME_BIN" --remove -d "$_d" --ecc >/dev/null 2>&1
-    rm -f "${ACME_CERT_DIR}/${_d}.crt" "${ACME_CERT_DIR}/${_d}.key"
+    rm -rf "$(acme_dir_for "$_d")"
     log_info "已删除 $_d 的证书"
     log_warn "注意: 引用了该证书的服务需要另行调整配置"
 }
@@ -1468,7 +1479,7 @@ acme_select_cert() {
     if [ "$_cnt" -eq 0 ]; then
         log_info "还没有已签发的证书, 进入申请流程"
         acme_issue_interactive || return 1
-        SELECTED_CERT_DOMAIN=$(basename "$ACME_CERT_PATH" .crt)
+        SELECTED_CERT_DOMAIN=$(dirname "$ACME_CERT_PATH"); SELECTED_CERT_DOMAIN=${SELECTED_CERT_DOMAIN##*/}
         SELECTED_CERT_CRT="$ACME_CERT_PATH"
         SELECTED_CERT_KEY="$ACME_KEY_PATH"
         return 0
@@ -1480,7 +1491,7 @@ acme_select_cert() {
     read_input "选择编号或 n" "1" _sel
     if [ "$_sel" = "n" ] || [ "$_sel" = "N" ]; then
         acme_issue_interactive || return 1
-        SELECTED_CERT_DOMAIN=$(basename "$ACME_CERT_PATH" .crt)
+        SELECTED_CERT_DOMAIN=$(dirname "$ACME_CERT_PATH"); SELECTED_CERT_DOMAIN=${SELECTED_CERT_DOMAIN##*/}
         SELECTED_CERT_CRT="$ACME_CERT_PATH"
         SELECTED_CERT_KEY="$ACME_KEY_PATH"
         return 0
@@ -1491,8 +1502,8 @@ acme_select_cert() {
         return 1
     fi
     SELECTED_CERT_DOMAIN="$_d"
-    SELECTED_CERT_CRT="${ACME_CERT_DIR}/${_d}.crt"
-    SELECTED_CERT_KEY="${ACME_CERT_DIR}/${_d}.key"
+    SELECTED_CERT_CRT=$(acme_crt_for "$_d")
+    SELECTED_CERT_KEY=$(acme_key_for "$_d")
     log_info "已选择证书: $_d"
 }
 
