@@ -12,6 +12,7 @@
 #   4 Sing-Box (SS2022/VLESS-Reality/AnyTLS+ACME)  5 防火墙(nftables)  6 TCP 调优(BBR)
 #   7 Realm 转发        8 Cloudflare DDNS  9 SSH 配置
 #   c ACME 证书 (Let's Encrypt, 独立模块, 任何服务都可引用)
+#   e 内存日志 (系统日志、/var/log tmpfs、禁用 Shell 持久历史)
 #   d 系统重装 (DD)
 # 用法: sudo sh setup.sh
 # ================================================================
@@ -52,6 +53,15 @@ SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
 SSHD_DROPIN="/etc/ssh/sshd_config.d/00-setup-script.conf"
 AUTH_KEYS_FILE="/root/.ssh/authorized_keys"
+JOURNAL_DROPIN_DIR="/etc/systemd/journald.conf.d"
+JOURNAL_DROPIN="/etc/systemd/journald.conf.d/90-volatile-only.conf"
+EPHEMERAL_BASH_CONFIG="/etc/profile.d/90-disable-shell-history.sh"
+EPHEMERAL_ZSH_CONFIG=""
+EPHEMERAL_ZSH_MARK_BEGIN="# === BEGIN setup.sh DISABLE ZSH HISTORY ==="
+EPHEMERAL_ZSH_MARK_END="# === END setup.sh DISABLE ZSH HISTORY ==="
+FSTAB_FILE="/etc/fstab"
+FSTAB_EPHEMERAL_MARKER="# managed-by-setup.sh-ephemeral-logs"
+FSTAB_EPHEMERAL_OLD_MARKER="# managed-by-debian13-ephemeral-logs"
 
 # ================================================================
 # 发行版检测 / 包管理抽象
@@ -4632,6 +4642,199 @@ ssh_password_enable() {
 }
 
 # ================================================================
+# 通用内存日志 (systemd / OpenRC / SysV)
+# ================================================================
+
+ephemeral_has_systemd() {
+    command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
+}
+
+ephemeral_var_log_is_tmpfs() {
+    awk '$2 == "/var/log" && $3 == "tmpfs" { found = 1 } END { exit !found }' \
+        /proc/mounts 2>/dev/null
+}
+
+ephemeral_backup_file() {
+    _src="$1"
+    _backup_dir="$2"
+    [ -e "$_src" ] || return 0
+    mkdir -p "$_backup_dir$(dirname "$_src")"
+    cp -p "$_src" "$_backup_dir$_src"
+}
+
+# 各发行版的 zsh 全局启动文件位置不同，优先采用系统中已存在的路径。
+ephemeral_resolve_zsh_config() {
+    if [ -f /etc/zsh/zshenv ]; then
+        EPHEMERAL_ZSH_CONFIG="/etc/zsh/zshenv"
+    elif [ -f /etc/zshenv ]; then
+        EPHEMERAL_ZSH_CONFIG="/etc/zshenv"
+    elif [ -f /etc/zsh.zshenv ]; then
+        EPHEMERAL_ZSH_CONFIG="/etc/zsh.zshenv"
+    else
+        case "$OS_FAMILY" in
+            rhel) EPHEMERAL_ZSH_CONFIG="/etc/zshenv" ;;
+            suse) EPHEMERAL_ZSH_CONFIG="/etc/zsh.zshenv" ;;
+            *)    EPHEMERAL_ZSH_CONFIG="/etc/zsh/zshenv" ;;
+        esac
+    fi
+}
+
+ephemeral_write_zsh_config() {
+    ephemeral_resolve_zsh_config
+    mkdir -p "$(dirname "$EPHEMERAL_ZSH_CONFIG")"
+    [ -e "$EPHEMERAL_ZSH_CONFIG" ] || { touch "$EPHEMERAL_ZSH_CONFIG"; chmod 644 "$EPHEMERAL_ZSH_CONFIG"; }
+    _tmp="${EPHEMERAL_ZSH_CONFIG}.tmp.$$"
+    awk -v begin="$EPHEMERAL_ZSH_MARK_BEGIN" -v end="$EPHEMERAL_ZSH_MARK_END" '
+        $0 == begin { skip = 1; next }
+        $0 == end   { skip = 0; next }
+        !skip       { print }
+    ' "$EPHEMERAL_ZSH_CONFIG" > "$_tmp" || { rm -f "$_tmp"; return 1; }
+    cat >> "$_tmp" <<EOF
+
+$EPHEMERAL_ZSH_MARK_BEGIN
+# Disable persistent Zsh command history system-wide.
+HISTFILE=/dev/null
+HISTSIZE=0
+SAVEHIST=0
+unsetopt APPEND_HISTORY 2>/dev/null || true
+unsetopt INC_APPEND_HISTORY 2>/dev/null || true
+unsetopt INC_APPEND_HISTORY_TIME 2>/dev/null || true
+unsetopt SHARE_HISTORY 2>/dev/null || true
+unsetopt EXTENDED_HISTORY 2>/dev/null || true
+$EPHEMERAL_ZSH_MARK_END
+EOF
+    cat "$_tmp" > "$EPHEMERAL_ZSH_CONFIG" && rm -f "$_tmp"
+}
+
+ephemeral_warn_application_logs() {
+    if command -v docker >/dev/null 2>&1; then
+        _driver=$(docker info --format '{{.LoggingDriver}}' 2>/dev/null || true)
+        if [ -n "$_driver" ] && [ "$_driver" != "none" ]; then
+            log_warn "Docker 日志驱动为 '$_driver'，/var/lib/docker 中的容器日志不受 /var/log tmpfs 覆盖"
+        fi
+    fi
+    log_warn "/opt、/srv、/var/lib、数据库及远程日志服务器中的应用日志不会被统一关闭"
+    log_warn "宿主机、服务商控制台和网络侧日志不受虚拟机内部配置控制"
+}
+
+ephemeral_install() {
+    ephemeral_resolve_zsh_config
+
+    _stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    _backup_dir="/root/ephemeral-logs-backup-$_stamp"
+    mkdir -p "$_backup_dir"
+    chmod 700 "$_backup_dir"
+    ephemeral_backup_file "$JOURNAL_DROPIN" "$_backup_dir"
+    ephemeral_backup_file "$EPHEMERAL_BASH_CONFIG" "$_backup_dir"
+    ephemeral_backup_file "$EPHEMERAL_ZSH_CONFIG" "$_backup_dir"
+    ephemeral_backup_file "$FSTAB_FILE" "$_backup_dir"
+
+    mkdir -p /etc/profile.d
+
+    if ephemeral_has_systemd; then
+        mkdir -p "$JOURNAL_DROPIN_DIR"
+        cat > "$JOURNAL_DROPIN" <<'EOF'
+[Journal]
+Storage=volatile
+RuntimeMaxUse=32M
+RuntimeMaxFileSize=8M
+ForwardToSyslog=no
+ForwardToKMsg=no
+ForwardToConsole=no
+ForwardToWall=no
+EOF
+    fi
+
+    cat > "$EPHEMERAL_BASH_CONFIG" <<'EOF'
+# Disable persistent Bash command history for interactive shells.
+export HISTFILE=/dev/null
+export HISTSIZE=0
+export HISTFILESIZE=0
+EOF
+
+    if ! ephemeral_write_zsh_config; then
+        log_error "无法更新 Zsh 全局配置: $EPHEMERAL_ZSH_CONFIG"
+        return 0
+    fi
+    chmod 644 "$EPHEMERAL_BASH_CONFIG" "$EPHEMERAL_ZSH_CONFIG"
+    [ ! -f "$JOURNAL_DROPIN" ] || chmod 644 "$JOURNAL_DROPIN"
+
+    if ! grep -Fq "$FSTAB_EPHEMERAL_MARKER" "$FSTAB_FILE" \
+        && ! grep -Fq "$FSTAB_EPHEMERAL_OLD_MARKER" "$FSTAB_FILE" \
+        && ! grep -Eq '^[[:space:]]*tmpfs[[:space:]]+/var/log[[:space:]]+tmpfs([[:space:]]|$)' "$FSTAB_FILE"; then
+        _fstab_opts="rw,nosuid,nodev,noexec,mode=0755,size=128M"
+        if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
+            _fstab_opts="${_fstab_opts},context=system_u:object_r:var_log_t:s0"
+        fi
+        printf '\n%s\n%s\n' \
+            "$FSTAB_EPHEMERAL_MARKER" \
+            "tmpfs /var/log tmpfs $_fstab_opts 0 0" \
+            >> "$FSTAB_FILE"
+    fi
+
+    if ephemeral_has_systemd; then
+        if ! systemctl restart systemd-journald; then
+            log_error "systemd-journald 重启失败，请检查配置"
+            return 0
+        fi
+    else
+        log_warn "当前系统不使用 systemd：已跳过 journald 配置，/var/log 将在重启后以 tmpfs 运行"
+    fi
+    log_info "配置完成，备份目录: $_backup_dir"
+    log_warn "请重启服务器，让 /var/log 的 tmpfs 完整生效: reboot"
+    ephemeral_warn_application_logs
+}
+
+ephemeral_purge_existing() {
+    printf "${RED}此操作将永久删除已有持久 journal（如有），以及 /root 和 /home 下常见的 Bash/Zsh 历史。${NC}\n"
+    read_input "输入 PURGE 确认删除 (回车取消)" "" _purge_confirm
+    if [ "$_purge_confirm" != "PURGE" ]; then
+        log_warn "已取消"
+        return 0
+    fi
+
+    if ephemeral_has_systemd; then
+        journalctl --rotate >/dev/null 2>&1 || true
+        journalctl --vacuum-time=1s >/dev/null 2>&1 || true
+        rm -rf --one-file-system /var/log/journal
+    fi
+    find /root /home -xdev -type f \
+        \( -name '.bash_history' -o -name '.zsh_history' -o -name '.sh_history' \) \
+        -delete 2>/dev/null || true
+    ephemeral_has_systemd && systemctl restart systemd-journald || true
+    log_info "已清理已知的持久 journal 和 Shell 历史；应用自有日志未删除"
+}
+
+ephemeral_status() {
+    ephemeral_resolve_zsh_config
+    printf "${MAGENTA}--- 内存日志状态 ---${NC}\n"
+    if ephemeral_has_systemd; then
+        printf "  journald 配置:\n"
+        if command -v systemd-analyze >/dev/null 2>&1; then
+            systemd-analyze cat-config systemd/journald.conf 2>/dev/null \
+                | grep -E '^(Storage|RuntimeMaxUse|RuntimeMaxFileSize|ForwardToSyslog)=' \
+                | sed 's/^/    /' || true
+        fi
+        printf "  journal 文件位置:\n"
+        journalctl --header 2>/dev/null | grep 'File path' | sed 's/^/    /' || true
+    else
+        printf "  日志服务:     ${CYAN}非 systemd（无需配置 journald）${NC}\n"
+    fi
+    printf "  挂载状态:\n"
+    if command -v findmnt >/dev/null 2>&1; then
+        findmnt /run 2>/dev/null | sed 's/^/    /' || true
+        findmnt /var/log 2>/dev/null | sed 's/^/    /' || true
+    else
+        mount 2>/dev/null | grep -E ' on /(run|var/log) ' | sed 's/^/    /' || true
+    fi
+    printf "  Shell 历史配置:\n"
+    ls -l "$EPHEMERAL_BASH_CONFIG" "$EPHEMERAL_ZSH_CONFIG" 2>/dev/null \
+        | sed 's/^/    /' || true
+    ephemeral_warn_application_logs
+    printf "${MAGENTA}--------------------${NC}\n"
+}
+
+# ================================================================
 # 子菜单: NTP 服务器 (增删改查)
 # ================================================================
 # ================================================================
@@ -4708,6 +4911,25 @@ brief_ssh() {
         printf '%s' "端口 ${_p} · ${YELLOW}密码开${NC}"
     else
         printf '%s' "端口 ${_p} · ${GREEN}仅密钥${NC}"
+    fi
+}
+
+brief_ephemeral() {
+    _ephemeral_ready=1
+    [ -f "$EPHEMERAL_BASH_CONFIG" ] || _ephemeral_ready=0
+    if ! grep -Eq '^[[:space:]]*tmpfs[[:space:]]+/var/log[[:space:]]+tmpfs([[:space:]]|$)' "$FSTAB_FILE" 2>/dev/null; then
+        _ephemeral_ready=0
+    fi
+    if ephemeral_has_systemd \
+        && { [ ! -f "$JOURNAL_DROPIN" ] || ! grep -Fq 'Storage=volatile' "$JOURNAL_DROPIN" 2>/dev/null; }; then
+        _ephemeral_ready=0
+    fi
+    if [ "$_ephemeral_ready" -ne 1 ]; then
+        printf '%s' "${GRAY}○ 未配置${NC}"
+    elif ephemeral_var_log_is_tmpfs; then
+        printf '%s' "${GREEN}● 已生效${NC}"
+    else
+        printf '%s' "${YELLOW}● 待重启${NC}"
     fi
 }
 
@@ -4936,6 +5158,16 @@ menu_ssh() {
 }
 
 # ================================================================
+# 子菜单: 内存日志
+# ================================================================
+ephemeral_items() {
+    printf '%s\n' "1|安装/重新应用内存日志配置|ephemeral_install|act"
+    printf '%s\n' "2|查看详细状态|ephemeral_status|act"
+    printf '%s\n' "3|${RED}清理已有日志和 Shell 历史 ⚠${NC}|ephemeral_purge_existing|act"
+}
+menu_ephemeral() { run_menu "内存日志" ephemeral_status ephemeral_items; }
+
+# ================================================================
 # 主菜单 (仪表盘)
 # ================================================================
 main_items() {
@@ -4949,6 +5181,7 @@ main_items() {
     printf '%s\n' "8|Cloudflare DDNS         $(brief_ddns)|menu_ddns|sub"
     printf '%s\n' "9|SSH 配置                $(brief_ssh)|menu_ssh|sub"
     printf '%s\n' "c|ACME 证书               $(brief_acme)|menu_acme|sub"
+    printf '%s\n' "e|内存日志                $(brief_ephemeral)|menu_ephemeral|sub"
     printf '%s\n' "d|${RED}系统重装 (DD) ⚠${NC}|task_system_reinstall|act"
 }
 menu_main() { run_menu "主菜单" - main_items top; }
