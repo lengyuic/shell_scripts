@@ -4,6 +4,7 @@
 # Linux VPS 一键配置脚本 (多发行版自动识别 / 单键菜单版)
 # 支持: Debian/Ubuntu (apt) · RHEL/CentOS/Rocky/AlmaLinux/Fedora (dnf/yum)
 #       Arch (pacman) · Alpine (apk) · openSUSE (zypper)
+# init: systemd · OpenRC · runit · SysV 自动识别, 服务操作统一走 svc_* 抽象层
 # 交互: 单键直达 (按键立即生效, 无需回车)
 #   0/ESC 返回上层 · m 直回主菜单 · q 随处退出
 #   主菜单为仪表盘, 实时显示各模块状态 (● 运行中 / ○ 未安装)
@@ -173,7 +174,377 @@ ensure_epel() {
     esac
 }
 
-# 解析 chrony 的配置文件路径与 systemd 服务名 (各发行版不同)
+# ================================================================
+# init 系统检测 / 服务管理抽象 (systemd · OpenRC · runit · SysV)
+# 脚本内所有服务操作统一走 svc_* 函数, 不直接调用 systemctl
+# ================================================================
+INIT_SYS=""
+RUNIT_SV_SRC=""
+RUNIT_SVDIR=""
+RC_LOCAL="/etc/rc.local"
+
+detect_init() {
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        INIT_SYS="systemd"
+    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+        INIT_SYS="openrc"
+    elif command -v sv >/dev/null 2>&1 && { [ -d /etc/sv ] || [ -d /etc/runit/sv ]; }; then
+        INIT_SYS="runit"
+        for d in /etc/sv /etc/runit/sv; do
+            [ -d "$d" ] && { RUNIT_SV_SRC="$d"; break; }
+        done
+        for d in /var/service /run/runit/service /etc/runit/runsvdir/default /service; do
+            [ -d "$d" ] && { RUNIT_SVDIR="$d"; break; }
+        done
+        [ -n "$RUNIT_SVDIR" ] && export SVDIR="$RUNIT_SVDIR"
+    elif [ -d /etc/init.d ] && { command -v service >/dev/null 2>&1 \
+            || command -v update-rc.d >/dev/null 2>&1 || command -v chkconfig >/dev/null 2>&1; }; then
+        INIT_SYS="sysv"
+    else
+        INIT_SYS="unknown"
+    fi
+}
+
+# SysV: 兼容 service(8) 缺失的系统
+_sysv_ctl() {
+    if command -v service >/dev/null 2>&1; then
+        service "$1" "$2"
+    else
+        "/etc/init.d/$1" "$2"
+    fi
+}
+
+# 服务定义是否存在
+svc_exists() {
+    case "$INIT_SYS" in
+        systemd)     systemctl cat -- "$1" >/dev/null 2>&1 ;;
+        openrc|sysv) [ -x "/etc/init.d/$1" ] ;;
+        runit)       [ -d "$RUNIT_SV_SRC/$1" ] || [ -d "$RUNIT_SVDIR/$1" ] ;;
+        *)           return 1 ;;
+    esac
+}
+
+# 在给定前缀下查找第一个匹配的服务名 (如 realm -> realm / realm-xxx)
+svc_find_prefix() {
+    case "$INIT_SYS" in
+        systemd)
+            _u=$(systemctl list-units "$1*.service" --all --no-legend 2>/dev/null \
+                | awk -v p="$1" 'index($1, p) == 1 {sub(/\.service$/, "", $1); print $1; exit}')
+            [ -z "$_u" ] && _u=$(systemctl list-unit-files "$1*.service" --no-legend 2>/dev/null \
+                | awk -v p="$1" 'index($1, p) == 1 && $1 !~ /@\.service$/ {sub(/\.service$/, "", $1); print $1; exit}')
+            [ -n "$_u" ] && printf '%s\n' "$_u"
+            ;;
+        openrc|sysv)
+            for f in /etc/init.d/"$1"*; do
+                [ -x "$f" ] && { basename "$f"; return 0; }
+            done
+            ;;
+        runit)
+            for f in "$RUNIT_SV_SRC"/"$1"*; do
+                [ -d "$f" ] && { basename "$f"; return 0; }
+            done
+            ;;
+    esac
+    return 0
+}
+
+svc_is_active() {
+    case "$INIT_SYS" in
+        systemd) systemctl is-active --quiet "$1" 2>/dev/null ;;
+        openrc)  rc-service "$1" status >/dev/null 2>&1 ;;
+        runit)   sv status "$1" 2>/dev/null | grep -q '^run:' ;;
+        sysv)    _sysv_ctl "$1" status >/dev/null 2>&1 ;;
+        *)       pidof "$1" >/dev/null 2>&1 ;;
+    esac
+}
+
+svc_is_enabled() {
+    case "$INIT_SYS" in
+        systemd) systemctl is-enabled --quiet "$1" 2>/dev/null ;;
+        openrc)  rc-update show 2>/dev/null | grep -qE "^[[:space:]]*$1[[:space:]]*\|" ;;
+        runit)   [ -e "$RUNIT_SVDIR/$1" ] && [ ! -f "$RUNIT_SVDIR/$1/down" ] ;;
+        sysv)    ls /etc/rc[2-5].d/S[0-9][0-9]"$1" >/dev/null 2>&1 ;;
+        *)       return 1 ;;
+    esac
+}
+
+svc_start() {
+    case "$INIT_SYS" in
+        systemd) systemctl start "$1" ;;
+        openrc)  rc-service "$1" start ;;
+        runit)   [ -e "$RUNIT_SVDIR/$1" ] || ln -sfn "$RUNIT_SV_SRC/$1" "$RUNIT_SVDIR/$1"
+                 sv up "$1" ;;
+        sysv)    _sysv_ctl "$1" start ;;
+        *)       return 1 ;;
+    esac
+}
+
+svc_stop() {
+    case "$INIT_SYS" in
+        systemd) systemctl stop "$1" ;;
+        openrc)  rc-service "$1" stop ;;
+        runit)   sv down "$1" ;;
+        sysv)    _sysv_ctl "$1" stop ;;
+        *)       return 1 ;;
+    esac
+}
+
+svc_restart() {
+    case "$INIT_SYS" in
+        systemd) systemctl restart "$1" ;;
+        openrc)  rc-service "$1" restart ;;
+        runit)   [ -e "$RUNIT_SVDIR/$1" ] || ln -sfn "$RUNIT_SV_SRC/$1" "$RUNIT_SVDIR/$1"
+                 sv restart "$1" || sv up "$1" ;;
+        sysv)    _sysv_ctl "$1" restart ;;
+        *)       return 1 ;;
+    esac
+}
+
+svc_enable() {
+    case "$INIT_SYS" in
+        systemd) systemctl enable "$1" ;;
+        openrc)  rc-update add "$1" default ;;
+        runit)   ln -sfn "$RUNIT_SV_SRC/$1" "$RUNIT_SVDIR/$1" && rm -f "$RUNIT_SVDIR/$1/down" ;;
+        sysv)    if command -v update-rc.d >/dev/null 2>&1; then update-rc.d "$1" defaults
+                 elif command -v chkconfig >/dev/null 2>&1; then chkconfig --add "$1" && chkconfig "$1" on
+                 else return 1; fi ;;
+        *)       return 1 ;;
+    esac
+}
+
+svc_disable() {
+    case "$INIT_SYS" in
+        systemd) systemctl disable "$1" ;;
+        openrc)  rc-update -a del "$1" ;;
+        runit)   if [ -L "$RUNIT_SVDIR/$1" ]; then rm -f "$RUNIT_SVDIR/$1"
+                 elif [ -d "$RUNIT_SVDIR/$1" ]; then touch "$RUNIT_SVDIR/$1/down"; fi ;;
+        sysv)    if command -v update-rc.d >/dev/null 2>&1; then update-rc.d -f "$1" remove
+                 elif command -v chkconfig >/dev/null 2>&1; then chkconfig "$1" off
+                 else return 1; fi ;;
+        *)       return 1 ;;
+    esac
+}
+
+# 启用并 (重) 启动
+svc_enable_now() {
+    svc_enable "$1" >/dev/null 2>&1 || true
+    svc_restart "$1"
+}
+
+# 停止并取消自启 (忽略错误)
+svc_stop_disable() {
+    svc_stop "$1" >/dev/null 2>&1 || true
+    svc_disable "$1" >/dev/null 2>&1 || true
+}
+
+# 重新读取服务定义 (仅 systemd 需要)
+svc_daemon_reload() {
+    [ "$INIT_SYS" = "systemd" ] && systemctl daemon-reload 2>/dev/null
+    return 0
+}
+
+# 给用户看的排错提示
+svc_status_hint() {
+    case "$INIT_SYS" in
+        systemd) printf 'systemctl status %s' "$1" ;;
+        openrc)  printf 'rc-service %s status' "$1" ;;
+        runit)   printf 'sv status %s' "$1" ;;
+        *)       printf 'service %s status' "$1" ;;
+    esac
+}
+
+svc_log_hint() {
+    case "$INIT_SYS" in
+        systemd) printf 'journalctl -u %s' "$1" ;;
+        *)       printf '/var/log/messages (或该服务自身日志)' ;;
+    esac
+}
+
+# 可嵌入到其他配置中的重启命令字符串 (如 acme 的 reloadcmd)
+svc_restart_cmd() {
+    case "$INIT_SYS" in
+        systemd) printf 'systemctl restart %s' "$1" ;;
+        openrc)  printf 'rc-service %s restart' "$1" ;;
+        runit)   printf 'sv restart %s' "$1" ;;
+        *)       printf 'service %s restart' "$1" ;;
+    esac
+}
+
+# 本脚本生成的服务定义文件路径
+svc_unit_path() {
+    case "$INIT_SYS" in
+        systemd) printf '/etc/systemd/system/%s.service' "$1" ;;
+        runit)   printf '%s/%s/run' "$RUNIT_SV_SRC" "$1" ;;
+        *)       printf '/etc/init.d/%s' "$1" ;;
+    esac
+}
+
+# svc_write_unit <名称> <描述> <命令行> [daemon|oneshot]
+#   daemon : 常驻进程, 由 init 监管并在异常退出时拉起
+#   oneshot: 开机执行一次的脚本 (runit 无原生 oneshot, 写入 rc.local)
+svc_write_unit() {
+    _name="$1"; _desc="$2"; _cmd="$3"; _mode="${4:-daemon}"
+    _path=$(svc_unit_path "$_name")
+    _exe=${_cmd%% *}
+    _args=${_cmd#"$_exe"}; _args=${_args# }
+
+    case "$INIT_SYS" in
+        systemd)
+            {
+                printf '[Unit]\nDescription=%s\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\n' "$_desc"
+                if [ "$_mode" = "oneshot" ]; then
+                    printf 'Type=oneshot\nRemainAfterExit=yes\nExecStart=%s\n' "$_cmd"
+                else
+                    printf 'Type=simple\nUser=root\nExecStart=%s\nRestart=on-failure\nRestartSec=5\nLimitNOFILE=1048576\n' "$_cmd"
+                fi
+                printf '\n[Install]\nWantedBy=multi-user.target\n'
+            } > "$_path"
+            systemctl daemon-reload 2>/dev/null || true
+            ;;
+        openrc)
+            if [ "$_mode" = "oneshot" ]; then
+                cat > "$_path" <<EOF
+#!/sbin/openrc-run
+description="${_desc}"
+
+depend() {
+    need net
+    after firewall
+}
+
+start() {
+    ebegin "Running ${_name}"
+    ${_cmd}
+    eend \$?
+}
+EOF
+            else
+                cat > "$_path" <<EOF
+#!/sbin/openrc-run
+description="${_desc}"
+supervisor=supervise-daemon
+command="${_exe}"
+command_args="${_args}"
+respawn_delay=5
+respawn_max=0
+rc_ulimit="-n 1048576"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+            fi
+            chmod +x "$_path"
+            ;;
+        runit)
+            if [ "$_mode" = "oneshot" ]; then
+                _rc_local_set_block "$_name" "$_cmd"
+            else
+                mkdir -p "$RUNIT_SV_SRC/$_name"
+                printf '#!/bin/sh\n# %s\nexec 2>&1\nulimit -n 1048576 2>/dev/null\nexec %s\n' "$_desc" "$_cmd" > "$_path"
+                chmod +x "$_path"
+            fi
+            ;;
+        sysv)
+            cat > "$_path" <<EOF
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ${_name}
+# Required-Start:    \$network \$remote_fs
+# Required-Stop:     \$network \$remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: ${_desc}
+### END INIT INFO
+NAME="${_name}"
+CMD="${_cmd}"
+MODE="${_mode}"
+PIDFILE="/var/run/\${NAME}.pid"
+
+is_running() {
+    [ "\$MODE" = "oneshot" ] && return 0
+    [ -f "\$PIDFILE" ] && kill -0 "\$(cat "\$PIDFILE")" 2>/dev/null
+}
+do_start() {
+    if [ "\$MODE" = "oneshot" ]; then \$CMD; return \$?; fi
+    is_running && { echo "\$NAME already running"; return 0; }
+    ulimit -n 1048576 2>/dev/null
+    nohup \$CMD >/dev/null 2>&1 &
+    echo \$! > "\$PIDFILE"
+}
+do_stop() {
+    [ "\$MODE" = "oneshot" ] && return 0
+    [ -f "\$PIDFILE" ] && kill "\$(cat "\$PIDFILE")" 2>/dev/null
+    rm -f "\$PIDFILE"
+}
+case "\$1" in
+    start)   do_start ;;
+    stop)    do_stop ;;
+    restart) do_stop; sleep 1; do_start ;;
+    status)  if is_running; then echo "\$NAME is running"; else echo "\$NAME is stopped"; exit 3; fi ;;
+    *)       echo "Usage: \$0 {start|stop|restart|status}"; exit 1 ;;
+esac
+EOF
+            chmod +x "$_path"
+            ;;
+        *)
+            log_error "未识别的 init 系统, 无法写入服务 $_name"
+            return 1
+            ;;
+    esac
+    log_info "已写入服务定义: $_path"
+}
+
+# 删除本脚本生成的服务定义 (先停止并取消自启)
+svc_remove_unit() {
+    svc_stop_disable "$1"
+    case "$INIT_SYS" in
+        systemd) rm -f "/etc/systemd/system/$1.service" "/lib/systemd/system/$1.service" "/usr/lib/systemd/system/$1.service"
+                 systemctl daemon-reload 2>/dev/null || true ;;
+        openrc|sysv) rm -f "/etc/init.d/$1" ;;
+        runit)   rm -f "$RUNIT_SVDIR/$1"; rm -rf "$RUNIT_SV_SRC/$1"; _rc_local_del_block "$1" ;;
+    esac
+}
+
+# rc.local 标记块 (runit 的 oneshot 兼容)
+_rc_local_set_block() {
+    _rc_local_del_block "$1"
+    if [ ! -f "$RC_LOCAL" ]; then
+        printf '#!/bin/sh\n' > "$RC_LOCAL"
+        chmod +x "$RC_LOCAL"
+    fi
+    printf '\n# === BEGIN setup.sh %s ===\n%s\n# === END setup.sh %s ===\n' "$1" "$2" "$1" >> "$RC_LOCAL"
+}
+
+_rc_local_del_block() {
+    [ -f "$RC_LOCAL" ] || return 0
+    grep -qF "# === BEGIN setup.sh $1 ===" "$RC_LOCAL" || return 0
+    sed -i "/# === BEGIN setup.sh $1 ===/,/# === END setup.sh $1 ===/d" "$RC_LOCAL"
+}
+
+# 安装并启用 cron (多发行版: 包名/服务名各异)
+ensure_cron() {
+    if ! command -v crontab >/dev/null 2>&1; then
+        log_info "安装 cron..."
+        case "$PKG_MGR" in
+            dnf|yum|pacman) cron_pkg="cronie" ;;
+            apk)            cron_pkg="dcron"  ;;
+            *)              cron_pkg="cron"   ;;
+        esac
+        pkg_update
+        pkg_install "$cron_pkg" || return 1
+    fi
+    for _svc in cron crond cronie dcron fcron; do
+        if svc_exists "$_svc"; then
+            svc_enable "$_svc" >/dev/null 2>&1 || true
+            svc_is_active "$_svc" || svc_start "$_svc" >/dev/null 2>&1 || true
+            break
+        fi
+    done
+}
+
+# 解析 chrony 的配置文件路径与服务名 (各发行版不同)
 resolve_chrony() {
     if [ -f /etc/chrony/chrony.conf ]; then
         CHRONY_CONF="/etc/chrony/chrony.conf"
@@ -186,10 +557,9 @@ resolve_chrony() {
         esac
     fi
 
-    unit_files=$(systemctl list-unit-files 2>/dev/null)
-    if printf '%s\n' "$unit_files" | grep -q '^chronyd\.service'; then
+    if svc_exists chronyd; then
         CHRONY_SERVICE="chronyd"
-    elif printf '%s\n' "$unit_files" | grep -q '^chrony\.service'; then
+    elif svc_exists chrony; then
         CHRONY_SERVICE="chrony"
     else
         case "$OS_FAMILY" in
@@ -423,6 +793,30 @@ validate_ipv4() {
     esac
 }
 
+# 修改登录 shell: usermod -> chsh -> 直接改 /etc/passwd (busybox 系统两者都可能没有)
+set_login_shell() {
+    _user="$1"; _shell="$2"
+    [ -x "$_shell" ] || { log_warn "$_shell 不可执行, 跳过修改登录 shell"; return 1; }
+    # chsh 要求目标 shell 在 /etc/shells 中
+    if [ -f /etc/shells ] && ! grep -qxF "$_shell" /etc/shells; then
+        echo "$_shell" >> /etc/shells
+    fi
+    if command -v usermod >/dev/null 2>&1 && usermod -s "$_shell" "$_user" 2>/dev/null; then
+        return 0
+    fi
+    if command -v chsh >/dev/null 2>&1 && chsh -s "$_shell" "$_user" </dev/null >/dev/null 2>&1; then
+        return 0
+    fi
+    if grep -q "^${_user}:" /etc/passwd; then
+        cp /etc/passwd /etc/passwd.setup-bak
+        sed -i "s|^\(${_user}:\([^:]*:\)\{5\}\)[^:]*$|\1${_shell}|" /etc/passwd
+        grep -q "^${_user}:.*:${_shell}$" /etc/passwd && return 0
+        cat /etc/passwd.setup-bak > /etc/passwd
+    fi
+    log_warn "无法修改 $_user 的登录 shell, 请手动执行: chsh -s $_shell $_user"
+    return 1
+}
+
 # ================================================================
 # 主菜单任务 1: 安装常用软件
 # ================================================================
@@ -460,7 +854,9 @@ task_install_common() {
         fi
 
         zsh_path=$(command -v zsh)
-        [ -n "$zsh_path" ] && usermod -s "$zsh_path" root
+        if [ -n "$zsh_path" ]; then
+            set_login_shell root "$zsh_path" || true
+        fi
 
         log_info "vim 鼠标禁用: 写入 $HOME/.vimrc"
         echo "set mouse=" > "$HOME/.vimrc"
@@ -484,7 +880,7 @@ ntp_status() {
         installed=0
     fi
 
-    if [ "$installed" -eq 1 ] && systemctl is-active --quiet "$CHRONY_SERVICE" 2>/dev/null; then
+    if [ "$installed" -eq 1 ] && svc_is_active "$CHRONY_SERVICE"; then
         printf "  服务状态: ${GREEN}已启用${NC}\n"
         running=1
     else
@@ -540,8 +936,7 @@ ntp_uninstall() {
         return 0
     fi
     confirm "确认卸载 chrony?" || { log_warn "已取消"; return 0; }
-    systemctl stop "$CHRONY_SERVICE" 2>/dev/null || true
-    systemctl disable "$CHRONY_SERVICE" 2>/dev/null || true
+    svc_stop_disable "$CHRONY_SERVICE"
     pkg_remove chrony
     log_info "chrony 已卸载"
 }
@@ -586,13 +981,13 @@ ntp_enable() {
         return 1
     fi
     ntp_apply_servers
-    systemctl enable "$CHRONY_SERVICE" >/dev/null 2>&1 || true
-    systemctl restart "$CHRONY_SERVICE"
+    svc_enable "$CHRONY_SERVICE" >/dev/null 2>&1 || true
+    svc_restart "$CHRONY_SERVICE"
     sleep 1
-    if systemctl is-active --quiet "$CHRONY_SERVICE"; then
+    if svc_is_active "$CHRONY_SERVICE"; then
         log_info "chrony 服务运行正常"
     else
-        log_error "chrony 启动失败, 请检查: systemctl status $CHRONY_SERVICE"
+        log_error "chrony 启动失败, 请检查: $(svc_status_hint "$CHRONY_SERVICE")"
         return 1
     fi
 }
@@ -603,8 +998,7 @@ ntp_disable() {
         log_warn "chrony 未安装"
         return 0
     fi
-    systemctl stop "$CHRONY_SERVICE" 2>/dev/null || true
-    systemctl disable "$CHRONY_SERVICE" 2>/dev/null || true
+    svc_stop_disable "$CHRONY_SERVICE"
     log_info "chrony 已停止并取消开机自启"
 }
 
@@ -614,7 +1008,7 @@ ntp_view_detail() {
         log_error "chrony 未安装"
         return 1
     fi
-    if ! systemctl is-active --quiet "$CHRONY_SERVICE" 2>/dev/null; then
+    if ! svc_is_active "$CHRONY_SERVICE"; then
         log_warn "chrony 服务未运行, 输出可能为空"
     fi
     printf "${CYAN}--- chronyc tracking ---${NC}\n"
@@ -629,7 +1023,7 @@ ntp_force_sync() {
         log_error "chrony 未安装"
         return 1
     fi
-    if ! systemctl is-active --quiet "$CHRONY_SERVICE" 2>/dev/null; then
+    if ! svc_is_active "$CHRONY_SERVICE"; then
         log_error "chrony 服务未运行, 请先启用"
         return 1
     fi
@@ -675,10 +1069,10 @@ ntp_servers_add() {
     echo "$NEW_SRV" >> "$NTP_SERVERS_FILE"
     log_info "已添加: $NEW_SRV"
 
-    if systemctl is-active --quiet "$CHRONY_SERVICE" 2>/dev/null; then
+    if svc_is_active "$CHRONY_SERVICE"; then
         log_info "检测到 chrony 正在运行, 自动重新应用配置..."
         ntp_apply_servers
-        systemctl restart "$CHRONY_SERVICE"
+        svc_restart "$CHRONY_SERVICE"
     fi
 }
 
@@ -708,10 +1102,10 @@ ntp_servers_delete() {
     mv "$tmp" "$NTP_SERVERS_FILE"
     log_info "已删除: $target"
 
-    if systemctl is-active --quiet "$CHRONY_SERVICE" 2>/dev/null; then
+    if svc_is_active "$CHRONY_SERVICE"; then
         log_info "检测到 chrony 正在运行, 自动重新应用配置..."
         ntp_apply_servers
-        systemctl restart "$CHRONY_SERVICE"
+        svc_restart "$CHRONY_SERVICE"
     fi
 }
 
@@ -758,10 +1152,10 @@ ntp_servers_modify() {
     mv "$tmp" "$NTP_SERVERS_FILE"
     log_info "已修改: $target -> $NEW_SRV"
 
-    if systemctl is-active --quiet "$CHRONY_SERVICE" 2>/dev/null; then
+    if svc_is_active "$CHRONY_SERVICE"; then
         log_info "检测到 chrony 正在运行, 自动重新应用配置..."
         ntp_apply_servers
-        systemctl restart "$CHRONY_SERVICE"
+        svc_restart "$CHRONY_SERVICE"
     fi
 }
 
@@ -782,7 +1176,7 @@ fail2ban_status() {
         ver=$(fail2ban-server --version 2>/dev/null | head -n 1)
         printf "  安装状态: ${GREEN}已安装${NC}  ${CYAN}%s${NC}\n" "$ver"
 
-        if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        if svc_is_active fail2ban; then
             printf "  服务状态: ${GREEN}active${NC}\n"
 
             jails=$(fail2ban_jail_list)
@@ -846,14 +1240,39 @@ fail2ban_uninstall() {
         return 0
     fi
     confirm "确认卸载 Fail2Ban?" || { log_warn "已取消"; return 0; }
-    systemctl stop fail2ban 2>/dev/null || true
-    systemctl disable fail2ban 2>/dev/null || true
+    svc_stop_disable fail2ban
     if [ "$OS_FAMILY" = "rhel" ]; then
         pkg_remove fail2ban-server fail2ban
     else
         pkg_remove fail2ban
     fi
     log_info "Fail2Ban 已卸载"
+}
+
+# 日志后端: systemd 用 journal, 其他 init 用文件轮询
+fail2ban_backend() {
+    if [ "$INIT_SYS" = "systemd" ] && [ -d /run/systemd/journal ]; then
+        printf 'systemd'
+    else
+        printf 'auto'
+    fi
+}
+
+# 非 systemd 系统: sshd 日志由 syslog 写文件, 各发行版路径不同, 显式指定 logpath
+fail2ban_sshd_logpath() {
+    [ "$(fail2ban_backend)" = "systemd" ] && return 0
+    for f in /var/log/auth.log /var/log/secure /var/log/messages; do
+        [ -f "$f" ] && { printf '%s' "$f"; return 0; }
+    done
+    return 1
+}
+
+fail2ban_emit_logpath() {
+    _lp=$(fail2ban_sshd_logpath) || {
+        log_warn "未找到 sshd 日志文件 (auth.log/secure/messages), 请确认 syslog 服务已启用" >&2
+        return 0
+    }
+    [ -n "$_lp" ] && echo "logpath = $_lp"
 }
 
 fail2ban_write_config() {
@@ -882,7 +1301,7 @@ ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
 bantime = 1h
 findtime = 10m
 maxretry = 5
-backend = systemd
+backend = $(fail2ban_backend)
 banaction = nftables-multiport
 banaction_allports = nftables-allports
 protocol = tcp
@@ -916,12 +1335,14 @@ EOF
                 sshd)
                     echo "port    = $port"
                     echo "mode    = normal"
+                    fail2ban_emit_logpath
                     [ -n "$maxretry" ] && echo "maxretry = $maxretry"
                     [ -n "$bantime" ]  && echo "bantime  = $bantime"
                     ;;
                 sshd-ddos)
                     echo "port    = $port"
                     echo "filter  = sshd-ddos"
+                    fail2ban_emit_logpath
                     [ -n "$maxretry" ] && echo "maxretry = $maxretry"
                     [ -n "$bantime" ]  && echo "bantime  = $bantime"
                     ;;
@@ -995,10 +1416,10 @@ fail2ban_jail_add() {
     echo "${name}|${port}|${maxretry}|${bantime}" >> "$FAIL2BAN_JAILS_FILE"
     log_info "已添加监狱: $name"
 
-    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    if svc_is_active fail2ban; then
         log_info "检测到 Fail2Ban 正在运行, 自动重新应用配置..."
         if fail2ban_write_config; then
-            systemctl restart fail2ban
+            svc_restart fail2ban
         fi
     fi
 }
@@ -1027,13 +1448,13 @@ fail2ban_jail_delete() {
     mv "$tmp" "$FAIL2BAN_JAILS_FILE"
     log_info "已删除监狱: $target"
 
-    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    if svc_is_active fail2ban; then
         log_info "检测到 Fail2Ban 正在运行, 自动重新应用配置..."
         if grep -qE '^[^#[:space:]].+' "$FAIL2BAN_JAILS_FILE" 2>/dev/null; then
-            fail2ban_write_config && systemctl restart fail2ban
+            fail2ban_write_config && svc_restart fail2ban
         else
             log_warn "已无任何监狱, 停止 Fail2Ban"
-            systemctl stop fail2ban
+            svc_stop fail2ban
         fi
     fi
 }
@@ -1079,9 +1500,9 @@ fail2ban_jail_modify() {
     mv "$tmp" "$FAIL2BAN_JAILS_FILE"
     log_info "已修改: $name"
 
-    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    if svc_is_active fail2ban; then
         log_info "检测到 Fail2Ban 正在运行, 自动重新应用配置..."
-        fail2ban_write_config && systemctl restart fail2ban
+        fail2ban_write_config && svc_restart fail2ban
     fi
 }
 
@@ -1092,14 +1513,14 @@ fail2ban_enable() {
         return 1
     fi
     fail2ban_write_config
-    systemctl daemon-reload
-    systemctl enable fail2ban >/dev/null 2>&1
-    systemctl restart fail2ban
+    svc_daemon_reload
+    svc_enable fail2ban >/dev/null 2>&1 || true
+    svc_restart fail2ban
     sleep 2
-    if systemctl is-active --quiet fail2ban; then
+    if svc_is_active fail2ban; then
         log_info "Fail2Ban 服务运行正常"
     else
-        log_error "Fail2Ban 启动失败, 请检查: systemctl status fail2ban"
+        log_error "Fail2Ban 启动失败, 请检查: $(svc_status_hint fail2ban)"
         return 1
     fi
 }
@@ -1110,8 +1531,7 @@ fail2ban_disable() {
         log_warn "Fail2Ban 未安装"
         return 0
     fi
-    systemctl stop fail2ban 2>/dev/null || true
-    systemctl disable fail2ban 2>/dev/null || true
+    svc_stop_disable fail2ban
     log_info "Fail2Ban 已停止并取消开机自启"
 }
 
@@ -1121,7 +1541,7 @@ fail2ban_view() {
         log_error "Fail2Ban 未安装"
         return 1
     fi
-    if ! systemctl is-active --quiet fail2ban 2>/dev/null; then
+    if ! svc_is_active fail2ban; then
         log_warn "Fail2Ban 服务未运行"
         return 0
     fi
@@ -1140,7 +1560,7 @@ fail2ban_unban() {
         log_error "Fail2Ban 未安装"
         return 1
     fi
-    if ! systemctl is-active --quiet fail2ban 2>/dev/null; then
+    if ! svc_is_active fail2ban; then
         log_error "Fail2Ban 服务未运行"
         return 1
     fi
@@ -1251,10 +1671,7 @@ acme_install() {
         pkg_install curl >/dev/null 2>&1
     fi
     # acme.sh 需要 cron 才能自动续期
-    if ! command -v crontab >/dev/null 2>&1; then
-        pkg_install cronie >/dev/null 2>&1 || pkg_install cron >/dev/null 2>&1 || \
-            log_warn "未能安装 cron, 自动续期可能不可用"
-    fi
+    ensure_cron >/dev/null 2>&1 || log_warn "未能安装 cron, 自动续期可能不可用"
     read_input "注册邮箱 (用于 CA 到期提醒)" "admin@example.com" ACME_EMAIL
     log_info "安装中..."
     curl -fsSL https://get.acme.sh | sh -s "email=${ACME_EMAIL}" >/dev/null 2>&1
@@ -1326,7 +1743,7 @@ acme_load_cf_token() {
 # 续期后要重载哪个服务 (装了 sing-box 就重启它, 否则留空)
 acme_default_reloadcmd() {
     if command -v sing-box >/dev/null 2>&1; then
-        printf '%s' "systemctl restart sing-box"
+        svc_restart_cmd sing-box
     else
         printf '%s' "true"
     fi
@@ -1525,7 +1942,7 @@ singbox_status() {
     if command -v sing-box >/dev/null 2>&1; then
         ver=$(sing-box version 2>/dev/null | head -n 1)
         printf "  安装状态: ${GREEN}已安装${NC}  ${CYAN}%s${NC}\n" "$ver"
-        if systemctl is-active --quiet sing-box 2>/dev/null; then
+        if svc_is_active sing-box; then
             printf "  服务状态: ${GREEN}运行中${NC}\n"
         else
             printf "  服务状态: ${YELLOW}未运行${NC}\n"
@@ -1538,6 +1955,13 @@ singbox_status() {
         printf "  安装状态: ${RED}未安装${NC}\n"
     fi
     printf "${MAGENTA}---------------------${NC}\n"
+}
+
+# 官方安装脚本在部分 init 系统下不会附带服务定义, 缺失时由本脚本补写
+singbox_ensure_service() {
+    svc_exists sing-box && return 0
+    _bin=$(command -v sing-box 2>/dev/null || echo /usr/local/bin/sing-box)
+    svc_write_unit sing-box "sing-box service" "$_bin run -c $SINGBOX_CONFIG"
 }
 
 singbox_install() {
@@ -1555,6 +1979,7 @@ singbox_install() {
         curl -fsSL https://sing-box.app/install.sh | sh
         if command -v sing-box >/dev/null 2>&1; then
             log_info "Sing-Box 安装成功"
+            singbox_ensure_service
         else
             log_error "Sing-Box 安装失败"
             exit 1
@@ -1569,10 +1994,8 @@ singbox_uninstall() {
         return 0
     fi
     confirm "确认卸载 Sing-Box?" || { log_warn "已取消"; return 0; }
-    systemctl stop sing-box 2>/dev/null || true
-    systemctl disable sing-box 2>/dev/null || true
-    rm -f /etc/systemd/system/sing-box.service /lib/systemd/system/sing-box.service 2>/dev/null
-    systemctl daemon-reload
+    svc_remove_unit sing-box
+    pkg_remove sing-box >/dev/null 2>&1 || true
     rm -f /usr/local/bin/sing-box /usr/bin/sing-box
     rm -rf "$SINGBOX_DIR"
     if command -v sing-box >/dev/null 2>&1; then
@@ -1588,14 +2011,14 @@ singbox_restart() {
         log_error "配置文件格式错误！"
         return 1
     fi
-    systemctl daemon-reload
-    systemctl enable sing-box >/dev/null 2>&1
-    systemctl restart sing-box
+    singbox_ensure_service
+    svc_enable sing-box >/dev/null 2>&1 || true
+    svc_restart sing-box
     sleep 2
-    if systemctl is-active --quiet sing-box; then
+    if svc_is_active sing-box; then
         log_info "服务启动成功"
     else
-        log_error "服务启动失败, 请检查: journalctl -u sing-box"
+        log_error "服务启动失败, 请检查: $(svc_log_hint sing-box)"
         return 1
     fi
 }
@@ -1880,8 +2303,7 @@ singbox_delete_proxy() {
         return 0
     fi
     confirm "确认删除当前代理配置并停止服务?" || { log_warn "已取消"; return 0; }
-    systemctl stop sing-box 2>/dev/null || true
-    systemctl disable sing-box 2>/dev/null || true
+    svc_stop_disable sing-box
     cp "$SINGBOX_CONFIG" "${SINGBOX_CONFIG}.bak.$(date +%s)" 2>/dev/null || true
     rm -f "$SINGBOX_CONFIG"
     log_info "代理已删除 (服务已停止), 原 config.json 已备份"
@@ -2425,8 +2847,30 @@ EOF
     return "$_ret"
 }
 
-# 把 live ruleset 持久化到 /etc/nftables.conf (包括用户其他 table), 同时备份白名单
+# 解析 nftables 服务开机加载的配置文件路径 (各发行版不同)
+#   Debian/Arch/SUSE: /etc/nftables.conf   Alpine (OpenRC): /etc/nftables.nft (可由 /etc/conf.d/nftables 覆盖)
+#   RHEL 系: /etc/sysconfig/nftables.conf   Void (runit): /etc/nftables.conf
+resolve_nft_conf() {
+    _c=""
+    if [ -f /etc/conf.d/nftables ]; then
+        _c=$(. /etc/conf.d/nftables 2>/dev/null; printf '%s' "${NFTABLES_CONF:-}")
+    fi
+    if [ -z "$_c" ]; then
+        if [ "$OS_FAMILY" = "rhel" ] && [ -d /etc/sysconfig ]; then
+            _c="/etc/sysconfig/nftables.conf"
+        elif [ "$OS_FAMILY" = "alpine" ] || [ -f /etc/nftables.nft ]; then
+            _c="/etc/nftables.nft"
+        else
+            _c="/etc/nftables.conf"
+        fi
+    fi
+    NFT_CONF="$_c"
+}
+
+# 把 live ruleset 持久化到 $NFT_CONF (包括用户其他 table), 同时备份白名单
 nft_persist() {
+    resolve_nft_conf
+    mkdir -p "$(dirname "$NFT_CONF")"
     {
         echo "#!/usr/sbin/nft -f"
         echo ""
@@ -2444,13 +2888,13 @@ nft_status() {
     if command -v nft >/dev/null 2>&1; then
         printf "  安装状态: ${GREEN}已安装${NC}\n"
 
-        if systemctl is-active --quiet nftables 2>/dev/null; then
+        if svc_is_active nftables; then
             printf "  运行状态: ${GREEN}运行中${NC}\n"
         else
             printf "  运行状态: ${YELLOW}未运行${NC}\n"
         fi
 
-        if systemctl is-enabled --quiet nftables 2>/dev/null; then
+        if svc_is_enabled nftables; then
             printf "  自启状态: ${GREEN}已启用${NC}\n"
         else
             printf "  自启状态: ${YELLOW}未启用${NC}\n"
@@ -2482,7 +2926,7 @@ nft_install() {
     fi
     pkg_update
     pkg_install nftables
-    systemctl enable nftables >/dev/null 2>&1 || true
+    svc_enable nftables >/dev/null 2>&1 || true
     log_info "nftables 安装完成"
 }
 
@@ -2493,8 +2937,7 @@ nft_uninstall() {
         return 0
     fi
     confirm "确认卸载 nftables?" || { log_warn "已取消"; return 0; }
-    systemctl stop nftables 2>/dev/null || true
-    systemctl disable nftables 2>/dev/null || true
+    svc_stop_disable nftables
     pkg_remove nftables
     log_info "nftables 已卸载"
 }
@@ -2528,8 +2971,8 @@ firewall_enable() {
     fi
 
     nft_persist
-    if ! systemctl enable --now nftables >/dev/null 2>&1; then
-        log_error "nftables 服务启动失败, 请检查: systemctl status nftables"
+    if ! svc_enable_now nftables >/dev/null 2>&1; then
+        log_error "nftables 服务启动失败, 请检查: $(svc_status_hint nftables)"
         return 1
     fi
     printf "${GREEN}✅ 防火墙已启用 (白名单 IP 数: %s)${NC}\n" "$cnt"
@@ -2564,6 +3007,7 @@ nft_clear() {
     confirm "确认清空所有 nftables 规则?" || { log_warn "已取消"; return 0; }
     nft_save_whitelist_file
     nft flush ruleset
+    resolve_nft_conf
     : > "$NFT_CONF"
     log_info "已清空 nftables 全部规则"
     if [ -s "$NFT_WL_FILE" ]; then
@@ -2710,7 +3154,7 @@ whitelist_modify() {
 # TCP 调优模块 (BBR + 系统参数)
 # ================================================================
 TCP_TUNE_CONF="/etc/sysctl.d/99-bbr-direct-manual.conf"
-BBR_PERSIST_SERVICE="/etc/systemd/system/bbr-optimize-persist.service"
+BBR_PERSIST_NAME="bbr-optimize-persist"
 BBR_PERSIST_SCRIPT="/usr/local/bin/bbr-optimize-apply.sh"
 BBR_BUFFER_MAX_MB=128
 BBR_BUFFER_MULTIPLIER="2.5"
@@ -2743,7 +3187,7 @@ tcp_status() {
         printf "  优化配置: ${YELLOW}未应用${NC}\n"
     fi
 
-    if [ -f "$BBR_PERSIST_SERVICE" ] && systemctl is-enabled --quiet bbr-optimize-persist.service 2>/dev/null; then
+    if _bbr_persist_present && svc_is_enabled "$BBR_PERSIST_NAME"; then
         printf "  开机持久化: ${GREEN}已启用${NC}\n"
     fi
     printf "${MAGENTA}--------------------${NC}\n"
@@ -2900,22 +3344,13 @@ _bbr_apply_mss_clamp() {
         || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 }
 
+# 持久化服务是否已由本脚本写入 (runit 的 oneshot 落在 rc.local)
+_bbr_persist_present() {
+    [ -f "$(svc_unit_path "$BBR_PERSIST_NAME")" ] || \
+        { [ -f "$RC_LOCAL" ] && grep -qF "# === BEGIN setup.sh $BBR_PERSIST_NAME ===" "$RC_LOCAL"; }
+}
+
 _bbr_install_persist() {
-    cat > "$BBR_PERSIST_SERVICE" <<'EOF'
-[Unit]
-Description=BBR Optimize - Restore tc fq and MSS clamp after boot
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/bin/bbr-optimize-apply.sh
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
     cat > "$BBR_PERSIST_SCRIPT" <<'EOF'
 #!/bin/sh
 for d in /sys/class/net/*; do
@@ -2965,8 +3400,8 @@ fi
 EOF
 
     chmod +x "$BBR_PERSIST_SCRIPT"
-    systemctl daemon-reload 2>/dev/null || true
-    systemctl enable bbr-optimize-persist.service 2>/dev/null || true
+    svc_write_unit "$BBR_PERSIST_NAME" "BBR Optimize - Restore tc fq and MSS clamp after boot" "$BBR_PERSIST_SCRIPT" oneshot
+    svc_enable "$BBR_PERSIST_NAME" >/dev/null 2>&1 || true
 }
 
 bbr_apply() {
@@ -3097,7 +3532,7 @@ EOF
 
 bbr_remove() {
     printf "${BLUE}=== 移除 BBR / TCP 调优 ===${NC}\n"
-    if [ ! -f "$TCP_TUNE_CONF" ] && [ ! -f "$BBR_PERSIST_SERVICE" ]; then
+    if [ ! -f "$TCP_TUNE_CONF" ] && ! _bbr_persist_present; then
         log_warn "未检测到本脚本的调优配置, 无需移除"
         return 0
     fi
@@ -3107,17 +3542,16 @@ bbr_remove() {
         rm -f "$TCP_TUNE_CONF"
         log_info "已删除 $TCP_TUNE_CONF"
     fi
-    if [ -f "$BBR_PERSIST_SERVICE" ]; then
-        systemctl disable bbr-optimize-persist.service 2>/dev/null || true
-        rm -f "$BBR_PERSIST_SERVICE"
-        log_info "已移除 $BBR_PERSIST_SERVICE"
+    if _bbr_persist_present; then
+        svc_remove_unit "$BBR_PERSIST_NAME"
+        log_info "已移除开机持久化服务 $BBR_PERSIST_NAME"
     fi
     if [ -f "$BBR_PERSIST_SCRIPT" ]; then
         rm -f "$BBR_PERSIST_SCRIPT"
         log_info "已移除 $BBR_PERSIST_SCRIPT"
     fi
 
-    systemctl daemon-reload 2>/dev/null || true
+    svc_daemon_reload
     sysctl --system >/dev/null 2>&1 || true
     log_info "完成. 部分内核参数 (如 tcp_rmem) 可能需要重启才能完全回退"
 }
@@ -3188,14 +3622,16 @@ realm_detect() {
         if [ -f "$c" ]; then REALM_CFG="$c"; break; fi
     done
 
-    # service: 先看 loaded units, 再看 unit-files
-    unit=$(systemctl list-units 'realm*.service' --all --no-legend 2>/dev/null \
-           | awk '/^realm.*\.service/ {print $1; exit}')
-    if [ -z "$unit" ]; then
-        unit=$(systemctl list-unit-files 'realm*.service' --no-legend 2>/dev/null \
-               | awk '/^realm.*\.service/ && $1 != "realm@.service" {print $1; exit}')
+    # service: 优先精确名 realm, 否则按前缀找 (realm-xxx 等)
+    if svc_exists realm; then
+        REALM_SERVICE="realm"
+    else
+        unit=$(svc_find_prefix realm)
+        case "$unit" in
+            ''|*@) ;;
+            *) REALM_SERVICE="$unit" ;;
+        esac
     fi
-    [ -n "$unit" ] && REALM_SERVICE="$unit"
 }
 
 # 解析 TOML 中的 [[endpoints]], 每行输出 "listen|remote"
@@ -3270,7 +3706,7 @@ realm_status() {
     fi
 
     if [ -n "$REALM_SERVICE" ]; then
-        if systemctl is-active --quiet "$REALM_SERVICE" 2>/dev/null; then
+        if svc_is_active "$REALM_SERVICE"; then
             printf "  服务状态: ${GREEN}运行中${NC}  (%s)\n" "$REALM_SERVICE"
         else
             printf "  服务状态: ${YELLOW}未运行${NC}  (%s)\n" "$REALM_SERVICE"
@@ -3357,28 +3793,10 @@ EOF
         log_info "已创建初始 /etc/realm/config.toml (无 endpoints, 请添加转发规则)"
     fi
 
-    # systemd service (使用检测到或默认的配置路径)
+    # 服务定义 (使用检测到或默认的配置路径, 按当前 init 系统生成)
     realm_detect
     cfg_for_service="${REALM_CFG:-/etc/realm/config.toml}"
-    cat > /etc/systemd/system/realm.service <<EOF
-[Unit]
-Description=Realm relay
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/realm -c ${cfg_for_service}
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    log_info "已写入 /etc/systemd/system/realm.service (Exec: realm -c $cfg_for_service)"
+    svc_write_unit realm "Realm relay" "/usr/local/bin/realm -c ${cfg_for_service}"
     log_info "完成. 下一步: '配置转发规则 -> 添加', 再 '启用 realm'"
 }
 
@@ -3391,12 +3809,10 @@ realm_uninstall() {
     fi
     confirm "确认卸载 realm?" || { log_warn "已取消"; return 0; }
 
-    if [ -n "$REALM_SERVICE" ]; then
-        systemctl stop "$REALM_SERVICE" 2>/dev/null || true
-        systemctl disable "$REALM_SERVICE" 2>/dev/null || true
+    if [ -n "$REALM_SERVICE" ] && [ "$REALM_SERVICE" != "realm" ]; then
+        svc_remove_unit "$REALM_SERVICE"
     fi
-    rm -f /etc/systemd/system/realm.service /lib/systemd/system/realm.service
-    systemctl daemon-reload 2>/dev/null || true
+    svc_remove_unit realm
 
     [ -n "$REALM_BIN" ] && rm -f "$REALM_BIN"
     rm -f /usr/local/bin/realm /usr/bin/realm /opt/realm/realm /etc/realm/realm
@@ -3421,13 +3837,13 @@ realm_enable() {
         log_warn "⚠️ 配置中没有转发规则 (endpoints), 启动后没有实际效果"
     fi
 
-    systemctl enable "$REALM_SERVICE" >/dev/null 2>&1
-    systemctl restart "$REALM_SERVICE"
+    svc_enable "$REALM_SERVICE" >/dev/null 2>&1 || true
+    svc_restart "$REALM_SERVICE"
     sleep 1
-    if systemctl is-active --quiet "$REALM_SERVICE"; then
+    if svc_is_active "$REALM_SERVICE"; then
         log_info "realm 已启用 (规则数: $cnt)"
     else
-        log_error "启动失败, 请检查: journalctl -u $REALM_SERVICE"
+        log_error "启动失败, 请检查: $(svc_log_hint "$REALM_SERVICE")"
         return 1
     fi
 }
@@ -3439,8 +3855,7 @@ realm_disable() {
         log_warn "未找到 realm service"
         return 0
     fi
-    systemctl stop "$REALM_SERVICE" 2>/dev/null || true
-    systemctl disable "$REALM_SERVICE" 2>/dev/null || true
+    svc_stop_disable "$REALM_SERVICE"
     log_info "realm 已停止并取消开机自启"
 }
 
@@ -3451,12 +3866,12 @@ realm_restart() {
         log_error "未找到 realm service"
         return 1
     fi
-    systemctl restart "$REALM_SERVICE"
+    svc_restart "$REALM_SERVICE"
     sleep 1
-    if systemctl is-active --quiet "$REALM_SERVICE"; then
+    if svc_is_active "$REALM_SERVICE"; then
         log_info "realm 已重启"
     else
-        log_error "重启失败, 请检查: journalctl -u $REALM_SERVICE"
+        log_error "重启失败, 请检查: $(svc_log_hint "$REALM_SERVICE")"
         return 1
     fi
 }
@@ -3538,9 +3953,9 @@ realm_endpoint_add() {
     } >> "$REALM_CFG"
     log_info "已添加: $LISTEN -> $REMOTE"
 
-    if [ -n "$REALM_SERVICE" ] && systemctl is-active --quiet "$REALM_SERVICE" 2>/dev/null; then
+    if [ -n "$REALM_SERVICE" ] && svc_is_active "$REALM_SERVICE"; then
         log_info "检测到 realm 正在运行, 自动重启..."
-        systemctl restart "$REALM_SERVICE"
+        svc_restart "$REALM_SERVICE"
     fi
 }
 
@@ -3592,9 +4007,9 @@ realm_endpoint_delete() {
     remote=$(printf '%s' "$target" | cut -d'|' -f2)
     log_info "已删除: $listen -> $remote"
 
-    if [ -n "$REALM_SERVICE" ] && systemctl is-active --quiet "$REALM_SERVICE" 2>/dev/null; then
+    if [ -n "$REALM_SERVICE" ] && svc_is_active "$REALM_SERVICE"; then
         log_info "检测到 realm 正在运行, 自动重启..."
-        systemctl restart "$REALM_SERVICE"
+        svc_restart "$REALM_SERVICE"
     fi
 }
 
@@ -3665,36 +4080,15 @@ realm_endpoint_modify() {
 
     log_info "已修改: $old_listen -> $old_remote  ==>  $NEW_LISTEN -> $NEW_REMOTE"
 
-    if [ -n "$REALM_SERVICE" ] && systemctl is-active --quiet "$REALM_SERVICE" 2>/dev/null; then
+    if [ -n "$REALM_SERVICE" ] && svc_is_active "$REALM_SERVICE"; then
         log_info "检测到 realm 正在运行, 自动重启..."
-        systemctl restart "$REALM_SERVICE"
+        svc_restart "$REALM_SERVICE"
     fi
 }
 
 # ================================================================
 # Cloudflare DDNS 模块
 # ================================================================
-
-# 安装并启用 cron (多发行版: 包名/服务名各异)
-ddns_ensure_cron() {
-    if ! command -v crontab >/dev/null 2>&1; then
-        log_info "安装 cron..."
-        case "$PKG_MGR" in
-            dnf|yum|pacman) cron_pkg="cronie" ;;
-            apk)            cron_pkg="dcron"  ;;
-            *)              cron_pkg="cron"   ;;
-        esac
-        pkg_update
-        pkg_install "$cron_pkg" || return 1
-    fi
-    for _svc in cron crond cronie dcron; do
-        if systemctl list-unit-files 2>/dev/null | grep -q "^${_svc}\.service"; then
-            systemctl enable "$_svc" >/dev/null 2>&1 || true
-            systemctl start "$_svc" 2>/dev/null || true
-            break
-        fi
-    done
-}
 ddns_cfg_get() {
     key="$1"
     [ -f "$DDNS_ZONE_FILE" ] || return 1
@@ -3798,7 +4192,7 @@ ddns_install() {
         pkg_update
         pkg_install $need_pkgs
     fi
-    ddns_ensure_cron
+    ensure_cron
 
     read_input "请输入完整域名 (如 home.example.com)" "" DDNS_DOMAIN
     if [ -z "$DDNS_DOMAIN" ]; then log_warn "已取消"; return 0; fi
@@ -4095,7 +4489,7 @@ ddns_resume() {
         log_error "DDNS 未安装"
         return 1
     fi
-    ddns_ensure_cron
+    ensure_cron
     log=$(ddns_log_path)
     cron_job="*/5 * * * * ${DDNS_SCRIPT} >> ${log} 2>&1"
     ( crontab -l 2>/dev/null | grep -v "ddns.sh"; echo "$cron_job" ) | crontab -
@@ -4370,17 +4764,13 @@ ssh_restore_config() {
 
 # 重启 sshd (兼容 systemd socket 激活 / OpenRC / SysV)
 ssh_restart_service() {
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl daemon-reload 2>/dev/null || true
+    if [ "$INIT_SYS" = "systemd" ]; then
+        svc_daemon_reload
         if systemctl is-active ssh.socket >/dev/null 2>&1; then
             systemctl restart ssh.socket 2>/dev/null || true
         fi
-        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
-    elif command -v rc-service >/dev/null 2>&1; then
-        rc-service sshd restart >/dev/null 2>&1
-    else
-        service sshd restart >/dev/null 2>&1 || service ssh restart >/dev/null 2>&1
     fi
+    svc_restart sshd >/dev/null 2>&1 || svc_restart ssh >/dev/null 2>&1
 }
 
 # 校验配置并重启, 失败自动回滚 (返回 1)
@@ -4646,7 +5036,7 @@ ssh_password_enable() {
 # ================================================================
 
 ephemeral_has_systemd() {
-    command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
+    [ "$INIT_SYS" = "systemd" ]
 }
 
 ephemeral_var_log_is_tmpfs() {
@@ -4841,12 +5231,7 @@ ephemeral_status() {
 # 模块状态速览 (主菜单仪表盘)
 # ================================================================
 svc_active() {
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl is-active --quiet "$1" 2>/dev/null && return 0
-    fi
-    if command -v rc-service >/dev/null 2>&1; then
-        rc-service "$1" status >/dev/null 2>&1 && return 0
-    fi
+    svc_is_active "$1" && return 0
     pidof "$1" >/dev/null 2>&1
 }
 
@@ -5189,11 +5574,15 @@ menu_main() { run_menu "主菜单" - main_items top; }
 # --- 入口 ---
 check_root
 detect_os
+detect_init
 if [ -z "$PKG_MGR" ]; then
     log_error "未能识别系统的包管理器, 软件安装相关功能将不可用"
     log_warn  "已识别系统: ${OS_PRETTY:-未知} (family=${OS_FAMILY:-unknown})"
 elif [ "$OS_FAMILY" = "unknown" ]; then
     log_warn "未能识别发行版系族 (${OS_PRETTY:-未知}), 将基于包管理器 ($PKG_MGR) 尽力运行"
+fi
+if [ "$INIT_SYS" = "unknown" ]; then
+    log_warn "未能识别 init 系统 (非 systemd/OpenRC/runit/SysV), 服务启停/自启相关功能将不可用"
 fi
 resolve_chrony
 IP_CACHE=$(get_server_ip)

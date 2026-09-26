@@ -14,6 +14,17 @@
 
 RHEL 系会在需要时自动启用 EPEL 仓库（fail2ban 依赖），并自动处理 `chrony`/`chronyd` 服务名、`chrony.conf` 路径、`vim-enhanced` 等发行版差异。
 
+同时**自动识别 init 系统**，所有服务启停 / 自启 / 状态查询统一走 `svc_*` 抽象层，不直接依赖 `systemctl`：
+
+| init | 代表发行版 | 服务定义位置 |
+|---|---|---|
+| systemd | Debian / Ubuntu / RHEL 系 / Arch / openSUSE | `/etc/systemd/system/<name>.service` |
+| OpenRC | Alpine / Gentoo / Artix (openrc) | `/etc/init.d/<name>`（`supervise-daemon` 监管）|
+| runit | Void / Artix (runit) | `/etc/sv/<name>/run`（oneshot 写入 `/etc/rc.local`）|
+| SysV | Devuan (sysvinit) 等 | `/etc/init.d/<name>`（LSB 头，`update-rc.d`/`chkconfig` 自启）|
+
+脚本自建的服务（realm、sing-box 缺失时补写、BBR 开机持久化）会按当前 init 生成对应格式的定义文件；Fail2Ban 在非 systemd 系统自动切换 `backend = auto` 并显式指定 sshd 日志路径；nftables 持久化路径按发行版选择（Debian/Arch `/etc/nftables.conf`、Alpine `/etc/nftables.nft`、RHEL `/etc/sysconfig/nftables.conf`）。
+
 ## 快速开始
 
 ```bash
@@ -105,7 +116,7 @@ q) 退出脚本
 - **移除 BBR 优化**：清掉 sysctl conf + 卸载持久化 service
 - **查看完整 TCP 参数**：dump 关键 sysctl + 每张网卡当前 qdisc
 - 配置写到 `/etc/sysctl.d/99-bbr-direct-manual.conf`
-- 安装 `bbr-optimize-persist.service` 开机自动恢复 `tc fq` / MSS clamp / initcwnd 32 / RPS
+- 安装 `bbr-optimize-persist` 开机服务（按 init 生成 systemd unit / OpenRC 脚本 / rc.local 块 / SysV 脚本）自动恢复 `tc fq` / MSS clamp / initcwnd 32 / RPS
 
 ### 7) Realm（TCP/UDP 转发）
 状态栏显示：安装 / 二进制路径 / 配置文件路径 / 服务状态 / 转发规则数。**自动检测 `/opt/realm` 与 `/etc/realm` 两个常见路径**。
@@ -171,12 +182,12 @@ q) 退出脚本
 | `/etc/chrony/chrony.conf` 或 `/etc/chrony.conf` | chrony 主配置（按发行版自动识别，脚本通过 sentinel 块注入自定义源）|
 | `/etc/fail2ban_jails.conf` | Fail2Ban 监狱清单 |
 | `/etc/fail2ban/jail.local` | 启用 Fail2Ban 时自动生成 |
-| `/etc/nftables.conf` | nft 规则持久化（含手动添加的其他 table）|
+| `/etc/nftables.conf` / `/etc/nftables.nft` / `/etc/sysconfig/nftables.conf` | nft 规则持久化（按发行版自动选择，含手动添加的其他 table）|
 | `/etc/sysctl.d/99-bbr-direct-manual.conf` | BBR + TCP 调优 sysctl |
-| `/etc/systemd/system/bbr-optimize-persist.service` | BBR 开机持久化 service |
+| `/etc/systemd/system/bbr-optimize-persist.service` 或 `/etc/init.d/bbr-optimize-persist` 或 `/etc/rc.local` 块 | BBR 开机持久化服务（按 init 生成）|
 | `/usr/local/bin/bbr-optimize-apply.sh` | BBR 开机执行脚本 |
 | `/etc/realm/config.toml` 或 `/opt/realm/config.toml` | Realm 配置（Realm 模块的唯一数据源）|
-| `/etc/systemd/system/realm.service` | Realm systemd service（新装时创建）|
+| `/etc/systemd/system/realm.service` 或 `/etc/init.d/realm` 或 `/etc/sv/realm/run` | Realm 服务定义（新装时按 init 创建）|
 | `/root/ddns.sh` | DDNS 更新脚本（crontab 每 5 分钟执行）|
 | `/root/.cf_token` | Cloudflare API Token（权限 600）|
 | `/root/.cf_zone` | DDNS 配置（域名 / Zone / 模式 / TTL）|
@@ -186,13 +197,13 @@ q) 退出脚本
 
 ## 依赖
 
-- 系统：基于 **systemd** 的主流发行版 —— Debian/Ubuntu、RHEL/CentOS/Rocky/AlmaLinux/Fedora、Arch、openSUSE 等（已识别 `apt`/`dnf`/`yum`/`pacman`/`apk`/`zypper`）
-- 必备工具：`curl`、`openssl`、`systemctl`、`awk`、`sed`
+- 系统：主流 Linux 发行版 —— Debian/Ubuntu、RHEL/CentOS/Rocky/AlmaLinux/Fedora、Arch、Alpine、openSUSE、Void 等（已识别 `apt`/`dnf`/`yum`/`pacman`/`apk`/`zypper`；init 支持 systemd / OpenRC / runit / SysV）
+- 必备工具：`curl`、`openssl`、`awk`、`sed`
 - 按需自动安装：`chrony`、`fail2ban`、`nftables`、`realm`、`python3`、`tar`、`cron`（DDNS 用，按发行版选 `cron`/`cronie`/`dcron`）
 
 `python3` 在 Sing-Box 查看链接和 DDNS 解析 Cloudflare API 响应时使用，脚本会按需调用对应包管理器安装。
 
-> 备注：脚本逻辑面向 systemd 发行版。Alpine 等使用 OpenRC（非 systemd）的系统能完成软件安装，但 `systemctl` 相关的服务启停/状态功能可能不适用。
+> 备注：「内存日志」模块中的 journald 配置仅在 systemd 上生效，非 systemd 系统只做 `/var/log` tmpfs 与 Shell 历史部分；Fail2Ban 在非 systemd 系统需要 syslog 服务（如 Alpine 的 busybox `syslog`）在写 `/var/log/messages`。
 
 ## 设计要点
 
