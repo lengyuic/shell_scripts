@@ -38,6 +38,8 @@ log_error() { printf "${RED}[ERROR]${NC} %s\n" "$1"; }
 # --- 全局常量 ---
 SINGBOX_CONFIG="/etc/sing-box/config.json"
 SINGBOX_DIR="/etc/sing-box"
+SINGBOX_STATE_DIR="/var/lib/sing-box"
+SINGBOX_PACKAGES="sing-box sing-box-beta sing-box-testing sing-box-oldstable sing-box-openrc"
 ACME_CERT_DIR="/etc/ssl/acme"
 NFT_CONF="/etc/nftables.conf"
 NFT_TABLE="landing_whitelist"
@@ -61,6 +63,7 @@ JOURNAL_DROPIN_DIR="/etc/systemd/journald.conf.d"
 JOURNAL_DROPIN="/etc/systemd/journald.conf.d/90-volatile-only.conf"
 EPHEMERAL_BASH_CONFIG="/etc/profile.d/90-disable-shell-history.sh"
 EPHEMERAL_ZSH_CONFIG=""
+EPHEMERAL_BACKUP_PREFIX="/root/ephemeral-logs-backup"
 EPHEMERAL_ZSH_MARK_BEGIN="# === BEGIN setup.sh DISABLE ZSH HISTORY ==="
 EPHEMERAL_ZSH_MARK_END="# === END setup.sh DISABLE ZSH HISTORY ==="
 FSTAB_FILE="/etc/fstab"
@@ -149,13 +152,84 @@ pkg_remove() {
     [ "$#" -gt 0 ] || return 0
     case "$PKG_MGR" in
         apt)    DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y "$@" ;;
-        dnf)    dnf remove -y "$@" ;;
-        yum)    yum remove -y "$@" ;;
-        pacman) pacman -Rns --noconfirm "$@" ;;
+        dnf)    dnf remove -y --setopt=clean_requirements_on_remove=False "$@" ;;
+        yum)    yum remove -y --setopt=clean_requirements_on_remove=False "$@" ;;
+        pacman) pacman -R --noconfirm "$@" ;;
         apk)    apk del "$@" ;;
         zypper) zypper --non-interactive remove "$@" ;;
         *) log_error "未检测到受支持的包管理器"; return 1 ;;
     esac
+}
+
+# Debian 的 c 状态仍有配置文件，允许再次执行 purge。
+pkg_present() {
+    case "$PKG_MGR" in
+        apt)    dpkg-query -W -f='${db:Status-Abbrev}\n' "$1" 2>/dev/null |
+                    grep -q '^.[cHUFWti]' ;;
+        dnf|yum|zypper) rpm -q "$1" >/dev/null 2>&1 ;;
+        pacman) pacman -Q "$1" >/dev/null 2>&1 ;;
+        apk)    apk info -e "$1" >/dev/null 2>&1 ;;
+        *)      return 1 ;;
+    esac
+}
+
+pkg_any_present() {
+    for candidate_pkg do
+        pkg_present "$candidate_pkg" && return 0
+    done
+    return 1
+}
+
+pkg_remove_present() (
+    for candidate_pkg do
+        shift
+        if pkg_present "$candidate_pkg"; then
+            set -- "$@" "$candidate_pkg"
+        fi
+    done
+    [ "$#" -gt 0 ] || return 0
+    if ! pkg_remove "$@"; then
+        log_error "软件包卸载失败: $*"
+        return 1
+    fi
+    if pkg_any_present "$@"; then
+        log_error "包管理器仍记录以下软件包中的至少一个: $*"
+        return 1
+    fi
+)
+
+pkg_owns_file() {
+    case "$PKG_MGR" in
+        apt)    dpkg-query -S "$1" >/dev/null 2>&1 ;;
+        dnf|yum|zypper) rpm -qf "$1" >/dev/null 2>&1 ;;
+        pacman) pacman -Qo "$1" >/dev/null 2>&1 ;;
+        apk)    apk info --who-owns "$1" >/dev/null 2>&1 ;;
+        *)      return 1 ;;
+    esac
+}
+
+remove_standalone_files() (
+    for standalone_path do
+        [ -f "$standalone_path" ] || [ -L "$standalone_path" ] || continue
+        if pkg_owns_file "$standalone_path"; then
+            log_error "$standalone_path 仍由软件包管理，请通过对应的包卸载"
+            return 1
+        fi
+    done
+    rm -f -- "$@" || { log_error "无法清理文件: $*"; return 1; }
+)
+
+# 仅传入当前模块专用的配置、状态或日志路径。
+remove_module_paths() {
+    rm -rf -- "$@" || { log_error "无法完全清理: $*"; return 1; }
+}
+
+any_path_exists() {
+    for module_path do
+        [ -e "$module_path" ] || [ -L "$module_path" ] || continue
+        return 0
+    done
+    return 1
 }
 
 # RHEL 系: 确保 EPEL 仓库可用 (fail2ban 等位于 EPEL)
@@ -222,8 +296,19 @@ svc_exists() {
     case "$INIT_SYS" in
         systemd)     systemctl cat -- "$1" >/dev/null 2>&1 ;;
         openrc|sysv) [ -x "/etc/init.d/$1" ] ;;
-        runit)       [ -d "$RUNIT_SV_SRC/$1" ] || [ -d "$RUNIT_SVDIR/$1" ] ;;
+        runit)       { [ -n "$RUNIT_SV_SRC" ] && [ -x "$RUNIT_SV_SRC/$1/run" ]; } ||
+                     { [ -n "$RUNIT_SVDIR" ] && [ -x "$RUNIT_SVDIR/$1/run" ]; } ;;
         *)           return 1 ;;
+    esac
+}
+
+svc_has_residue() {
+    svc_exists "$1" && return 0
+    case "$INIT_SYS" in
+        systemd) any_path_exists "/etc/systemd/system/$1.service.d" "/run/systemd/system/$1.service.d" ;;
+        runit)   { [ -n "$RUNIT_SVDIR" ] && any_path_exists "$RUNIT_SVDIR/$1"; } ||
+                 { [ -n "$RUNIT_SV_SRC" ] && any_path_exists "$RUNIT_SV_SRC/$1"; } ;;
+        *)       return 1 ;;
     esac
 }
 
@@ -231,20 +316,20 @@ svc_exists() {
 svc_find_prefix() {
     case "$INIT_SYS" in
         systemd)
-            _u=$(systemctl list-units "$1*.service" --all --no-legend 2>/dev/null \
-                | awk -v p="$1" 'index($1, p) == 1 {sub(/\.service$/, "", $1); print $1; exit}')
-            [ -z "$_u" ] && _u=$(systemctl list-unit-files "$1*.service" --no-legend 2>/dev/null \
-                | awk -v p="$1" 'index($1, p) == 1 && $1 !~ /@\.service$/ {sub(/\.service$/, "", $1); print $1; exit}')
+            _u=$(systemctl list-units "$1-*.service" "$1@*.service" --all --plain --no-legend 2>/dev/null \
+                | awk -v p="$1" '($1 ~ ("^" p "[-@].+\\.service$")) && $2 != "not-found" {sub(/\.service$/, "", $1); print $1; exit}')
+            [ -z "$_u" ] && _u=$(systemctl list-unit-files "$1-*.service" "$1@*.service" --no-legend 2>/dev/null \
+                | awk -v p="$1" '$1 ~ ("^" p "[-@].+\\.service$") {sub(/\.service$/, "", $1); print $1; exit}')
             [ -n "$_u" ] && printf '%s\n' "$_u"
             ;;
         openrc|sysv)
-            for f in /etc/init.d/"$1"*; do
+            for f in /etc/init.d/"$1"-* /etc/init.d/"$1"@*; do
                 [ -x "$f" ] && { basename "$f"; return 0; }
             done
             ;;
         runit)
-            for f in "$RUNIT_SV_SRC"/"$1"*; do
-                [ -d "$f" ] && { basename "$f"; return 0; }
+            for f in "$RUNIT_SV_SRC"/"$1"-* "$RUNIT_SV_SRC"/"$1"@*; do
+                [ -n "$RUNIT_SV_SRC" ] && [ -x "$f/run" ] && { basename "$f"; return 0; }
             done
             ;;
     esac
@@ -256,16 +341,20 @@ svc_is_active() {
         systemd) systemctl is-active --quiet "$1" 2>/dev/null ;;
         openrc)  rc-service "$1" status >/dev/null 2>&1 ;;
         runit)   sv status "$1" 2>/dev/null | grep -q '^run:' ;;
-        sysv)    _sysv_ctl "$1" status >/dev/null 2>&1 ;;
+        sysv)    ! grep -qx 'MODE="oneshot"' "/etc/init.d/$1" 2>/dev/null &&
+                     _sysv_ctl "$1" status >/dev/null 2>&1 ;;
         *)       pidof "$1" >/dev/null 2>&1 ;;
     esac
 }
 
 svc_is_enabled() {
     case "$INIT_SYS" in
-        systemd) systemctl is-enabled --quiet "$1" 2>/dev/null ;;
-        openrc)  rc-update show 2>/dev/null | grep -qE "^[[:space:]]*$1[[:space:]]*\|" ;;
-        runit)   [ -e "$RUNIT_SVDIR/$1" ] && [ ! -f "$RUNIT_SVDIR/$1/down" ] ;;
+        systemd) case "$(systemctl is-enabled "$1" 2>/dev/null)" in
+                     enabled|enabled-runtime|linked|linked-runtime) return 0 ;;
+                     *) return 1 ;;
+                 esac ;;
+        openrc)  rc-update show 2>/dev/null | awk -v name="$1" '$1 == name && $2 == "|" && NF > 2 { found = 1 } END { exit !found }' ;;
+        runit)   [ -n "$RUNIT_SVDIR" ] && [ -e "$RUNIT_SVDIR/$1" ] && [ ! -f "$RUNIT_SVDIR/$1/down" ] ;;
         sysv)    ls /etc/rc[2-5].d/S[0-9][0-9]"$1" >/dev/null 2>&1 ;;
         *)       return 1 ;;
     esac
@@ -334,10 +423,20 @@ svc_enable_now() {
     svc_restart "$1"
 }
 
-# 停止并取消自启 (忽略错误)
+# 停止并取消自启。已停止或未启用的服务可重复处理。
 svc_stop_disable() {
-    svc_stop "$1" >/dev/null 2>&1 || true
-    svc_disable "$1" >/dev/null 2>&1 || true
+    if svc_is_active "$1"; then
+        svc_stop "$1" && ! svc_is_active "$1" || {
+            log_error "无法停止服务 $1"
+            return 1
+        }
+    fi
+    if svc_is_enabled "$1"; then
+        svc_disable "$1" && ! svc_is_enabled "$1" || {
+            log_error "无法取消服务 $1 的开机启动"
+            return 1
+        }
+    fi
 }
 
 # 重新读取服务定义 (仅 systemd 需要)
@@ -401,12 +500,12 @@ svc_write_unit() {
                     printf 'Type=simple\nUser=root\nExecStart=%s\nRestart=on-failure\nRestartSec=5\nLimitNOFILE=1048576\n' "$_cmd"
                 fi
                 printf '\n[Install]\nWantedBy=multi-user.target\n'
-            } > "$_path"
-            systemctl daemon-reload 2>/dev/null || true
+            } > "$_path" || return 1
+            systemctl daemon-reload || return 1
             ;;
         openrc)
             if [ "$_mode" = "oneshot" ]; then
-                cat > "$_path" <<EOF
+                cat > "$_path" <<EOF || return 1
 #!/sbin/openrc-run
 description="${_desc}"
 
@@ -422,7 +521,7 @@ start() {
 }
 EOF
             else
-                cat > "$_path" <<EOF
+                cat > "$_path" <<EOF || return 1
 #!/sbin/openrc-run
 description="${_desc}"
 supervisor=supervise-daemon
@@ -438,19 +537,19 @@ depend() {
 }
 EOF
             fi
-            chmod +x "$_path"
+            chmod +x "$_path" || return 1
             ;;
         runit)
             if [ "$_mode" = "oneshot" ]; then
-                _rc_local_set_block "$_name" "$_cmd"
+                _rc_local_set_block "$_name" "$_cmd" || return 1
             else
-                mkdir -p "$RUNIT_SV_SRC/$_name"
-                printf '#!/bin/sh\n# %s\nexec 2>&1\nulimit -n 1048576 2>/dev/null\nexec %s\n' "$_desc" "$_cmd" > "$_path"
-                chmod +x "$_path"
+                [ -n "$RUNIT_SV_SRC" ] && mkdir -p "$RUNIT_SV_SRC/$_name" || return 1
+                printf '#!/bin/sh\n# %s\nexec 2>&1\nulimit -n 1048576 2>/dev/null\nexec %s\n' "$_desc" "$_cmd" > "$_path" || return 1
+                chmod +x "$_path" || return 1
             fi
             ;;
         sysv)
-            cat > "$_path" <<EOF
+            cat > "$_path" <<EOF || return 1
 #!/bin/sh
 ### BEGIN INIT INFO
 # Provides:          ${_name}
@@ -489,7 +588,7 @@ case "\$1" in
     *)       echo "Usage: \$0 {start|stop|restart|status}"; exit 1 ;;
 esac
 EOF
-            chmod +x "$_path"
+            chmod +x "$_path" || return 1
             ;;
         *)
             log_error "未识别的 init 系统, 无法写入服务 $_name"
@@ -501,21 +600,28 @@ EOF
 
 # 删除本脚本生成的服务定义 (先停止并取消自启)
 svc_remove_unit() {
-    svc_stop_disable "$1"
+    svc_stop_disable "$1" || return 1
     case "$INIT_SYS" in
-        systemd) rm -f "/etc/systemd/system/$1.service" "/lib/systemd/system/$1.service" "/usr/lib/systemd/system/$1.service"
-                 systemctl daemon-reload 2>/dev/null || true ;;
-        openrc|sysv) rm -f "/etc/init.d/$1" ;;
-        runit)   rm -f "$RUNIT_SVDIR/$1"; rm -rf "$RUNIT_SV_SRC/$1"; _rc_local_del_block "$1" ;;
+        systemd) remove_standalone_files "/etc/systemd/system/$1.service" \
+                     "/run/systemd/system/$1.service" \
+                     "/usr/local/lib/systemd/system/$1.service" \
+                     "/usr/lib/systemd/system/$1.service" "/lib/systemd/system/$1.service" &&
+                 remove_module_paths "/etc/systemd/system/$1.service.d" "/run/systemd/system/$1.service.d" &&
+                 systemctl daemon-reload ;;
+        openrc|sysv) remove_standalone_files "/etc/init.d/$1" ;;
+        runit)
+            [ -z "$RUNIT_SVDIR" ] || remove_module_paths "$RUNIT_SVDIR/$1" || return 1
+            [ -z "$RUNIT_SV_SRC" ] || remove_module_paths "$RUNIT_SV_SRC/$1" || return 1
+            _rc_local_del_block "$1"
+            ;;
     esac
 }
 
 # rc.local 标记块 (runit 的 oneshot 兼容)
 _rc_local_set_block() {
-    _rc_local_del_block "$1"
+    _rc_local_del_block "$1" || return 1
     if [ ! -f "$RC_LOCAL" ]; then
-        printf '#!/bin/sh\n' > "$RC_LOCAL"
-        chmod +x "$RC_LOCAL"
+        printf '#!/bin/sh\n' > "$RC_LOCAL" && chmod +x "$RC_LOCAL" || return 1
     fi
     printf '\n# === BEGIN setup.sh %s ===\n%s\n# === END setup.sh %s ===\n' "$1" "$2" "$1" >> "$RC_LOCAL"
 }
@@ -531,7 +637,7 @@ ensure_cron() {
     if ! command -v crontab >/dev/null 2>&1; then
         log_info "安装 cron..."
         case "$PKG_MGR" in
-            dnf|yum|pacman) cron_pkg="cronie" ;;
+            dnf|yum|pacman|zypper) cron_pkg="cronie" ;;
             apk)            cron_pkg="dcron"  ;;
             *)              cron_pkg="cron"   ;;
         esac
@@ -540,12 +646,55 @@ ensure_cron() {
     fi
     for _svc in cron crond cronie dcron fcron; do
         if svc_exists "$_svc"; then
-            svc_enable "$_svc" >/dev/null 2>&1 || true
-            svc_is_active "$_svc" || svc_start "$_svc" >/dev/null 2>&1 || true
-            break
+            svc_is_enabled "$_svc" || svc_enable "$_svc" || return 1
+            svc_is_active "$_svc" || svc_start "$_svc" || return 1
+            return 0
         fi
     done
+    command -v crontab >/dev/null 2>&1
 }
+
+# 区分没有 crontab 和读取失败，避免误覆盖已有任务。
+cron_read() (
+    command -v crontab >/dev/null 2>&1 || return 0
+    cron_errors=$(mktemp) || return 1
+    trap 'rm -f "$cron_errors"' EXIT
+    if cron_contents=$(LC_ALL=C crontab -l 2>"$cron_errors"); then
+        [ -z "$cron_contents" ] || printf '%s\n' "$cron_contents"
+        return 0
+    fi
+    case "$(cat "$cron_errors")" in
+        'no crontab for '*|'crontab: no crontab for '*|"crontab: can't open "*": No such file or directory")
+            return 0 ;;
+    esac
+    cat "$cron_errors" >&2
+    return 1
+)
+
+cron_job_filter() {
+    awk -v path="$1" -v mode="$2" -v argument="$3" '
+        $1 !~ /^#/ {
+            command = $6
+            gsub(/^["\047]|["\047]$/, "", command)
+            if (command == path && (argument == "" || $7 == argument)) {
+                found = 1
+                if (mode == "remove") next
+            }
+        }
+        mode == "remove" { print }
+        END { if (mode == "check") exit !found }
+    '
+}
+
+cron_replace_job() (
+    cron_before=$(cron_read) || return 1
+    cron_after=$(printf '%s\n' "$cron_before" | cron_job_filter "$1" remove "$2") || return 1
+    [ -n "$3" ] || [ "$cron_after" != "$cron_before" ] || return 0
+    {
+        [ -z "$cron_after" ] || printf '%s\n' "$cron_after"
+        [ -z "$3" ] || printf '%s\n' "$3"
+    } | crontab -
+)
 
 # 解析 chrony 的配置文件路径与服务名 (各发行版不同)
 resolve_chrony() {
@@ -826,8 +975,7 @@ set_login_shell() {
 task_install_common() {
     printf "${BLUE}=== 安装常用软件 (vim/git/curl/wget/tar/zsh + oh-my-zsh) ===${NC}\n"
     (
-        set -e
-        pkg_update
+        pkg_update || exit 1
 
         # vim 在 RHEL 系的完整包名为 vim-enhanced
         case "$OS_FAMILY" in
@@ -843,17 +991,19 @@ task_install_common() {
         command -v wget >/dev/null 2>&1 || pkgs="$pkgs wget"
         command -v zsh  >/dev/null 2>&1 || pkgs="$pkgs zsh"
 
-        pkg_install $pkgs
+        pkg_install $pkgs || { log_error "常用软件安装失败"; exit 1; }
 
         if [ ! -d "$HOME/.oh-my-zsh" ]; then
             log_info "安装 oh-my-zsh..."
-            sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+            omz_installer=$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh) &&
+                sh -c "$omz_installer" "" --unattended ||
+                { log_error "oh-my-zsh 安装失败"; exit 1; }
         else
             log_info "oh-my-zsh 已存在, 跳过安装"
         fi
 
         if [ -f "$HOME/.zshrc" ]; then
-            sed -i 's/ZSH_THEME="robbyrussell"/ZSH_THEME="ys"/' "$HOME/.zshrc"
+            sed -i 's/ZSH_THEME="robbyrussell"/ZSH_THEME="ys"/' "$HOME/.zshrc" || exit 1
         fi
 
         zsh_path=$(command -v zsh)
@@ -862,7 +1012,9 @@ task_install_common() {
         fi
 
         log_info "vim 鼠标禁用: 写入 $HOME/.vimrc"
-        echo "set mouse=" > "$HOME/.vimrc"
+        if ! grep -qxF 'set mouse=' "$HOME/.vimrc" 2>/dev/null; then
+            printf '\nset mouse=\n' >> "$HOME/.vimrc" || exit 1
+        fi
 
         log_info "安装完成. 重新登录后 zsh 生效"
     )
@@ -927,21 +1079,37 @@ ntp_install() {
         return 0
     fi
     pkg_update
-    pkg_install chrony
+    pkg_install chrony && command -v chronyd >/dev/null 2>&1 ||
+        { log_error "chrony 安装失败"; return 1; }
     resolve_chrony
     log_info "chrony 安装完成"
 }
 
+ntp_has_residue() {
+    command -v chronyd >/dev/null 2>&1 || pkg_any_present chrony chrony-openrc ||
+        svc_has_residue chrony || svc_has_residue chronyd ||
+        any_path_exists "$NTP_SERVERS_FILE" /etc/chrony /etc/chrony.conf* /var/lib/chrony /var/log/chrony
+}
+
 ntp_uninstall() {
     printf "${BLUE}=== 卸载 chrony ===${NC}\n"
-    if ! command -v chronyd >/dev/null 2>&1; then
+    if ! ntp_has_residue; then
         log_warn "chrony 未安装, 无需卸载"
         return 0
     fi
-    confirm "确认卸载 chrony?" || { log_warn "已取消"; return 0; }
-    svc_stop_disable "$CHRONY_SERVICE"
-    pkg_remove chrony
-    log_info "chrony 已卸载"
+    confirm "确认卸载 chrony，并删除配置、自定义 NTP 列表和日志?" || { log_warn "已取消"; return 0; }
+    svc_stop_disable chrony && svc_stop_disable chronyd || return 1
+    pkg_remove_present chrony chrony-openrc || return 1
+    hash -r
+    if command -v chronyd >/dev/null 2>&1; then
+        log_error "仍检测到 chronyd: $(command -v chronyd)"
+        return 1
+    fi
+    svc_remove_unit chrony && svc_remove_unit chronyd || return 1
+    remove_module_paths "$NTP_SERVERS_FILE" /etc/chrony /etc/chrony.conf /etc/chrony.conf.* \
+        /etc/default/chrony /etc/default/chronyd /etc/sysconfig/chronyd /etc/conf.d/chronyd \
+        /var/lib/chrony /var/log/chrony /run/chrony || return 1
+    log_info "chrony 已完全卸载"
 }
 
 # 把 NTP_SERVERS_FILE 写入 chrony.conf 的标记块
@@ -1001,7 +1169,7 @@ ntp_disable() {
         log_warn "chrony 未安装"
         return 0
     fi
-    svc_stop_disable "$CHRONY_SERVICE"
+    svc_stop_disable "$CHRONY_SERVICE" || return 1
     log_info "chrony 已停止并取消开机自启"
 }
 
@@ -1224,9 +1392,10 @@ fail2ban_install() {
     if [ "$OS_FAMILY" = "rhel" ]; then
         # RHEL 系: fail2ban 位于 EPEL; systemd 后端需要 python3-systemd
         ensure_epel
-        pkg_install fail2ban-server nftables python3-systemd || pkg_install fail2ban nftables
+        pkg_install fail2ban-server nftables python3-systemd || pkg_install fail2ban nftables ||
+            { log_error "Fail2Ban 安装失败"; return 1; }
     else
-        pkg_install fail2ban nftables
+        pkg_install fail2ban nftables || { log_error "Fail2Ban 安装失败"; return 1; }
     fi
     if command -v fail2ban-server >/dev/null 2>&1; then
         log_info "Fail2Ban 安装完成"
@@ -1236,20 +1405,32 @@ fail2ban_install() {
     fi
 }
 
+fail2ban_has_residue() {
+    command -v fail2ban-server >/dev/null 2>&1 || pkg_any_present fail2ban fail2ban-server fail2ban-openrc ||
+        svc_has_residue fail2ban || any_path_exists "$FAIL2BAN_JAILS_FILE" /etc/fail2ban \
+            /var/lib/fail2ban /var/log/fail2ban /var/log/fail2ban.log /var/log/fail2ban.log.*
+}
+
 fail2ban_uninstall() {
     printf "${BLUE}=== 卸载 Fail2Ban ===${NC}\n"
-    if ! command -v fail2ban-server >/dev/null 2>&1; then
+    if ! fail2ban_has_residue; then
         log_warn "Fail2Ban 未安装, 无需卸载"
         return 0
     fi
-    confirm "确认卸载 Fail2Ban?" || { log_warn "已取消"; return 0; }
-    svc_stop_disable fail2ban
-    if [ "$OS_FAMILY" = "rhel" ]; then
-        pkg_remove fail2ban-server fail2ban
-    else
-        pkg_remove fail2ban
+    confirm "确认卸载 Fail2Ban，并删除监狱配置、封禁数据库和日志?" || { log_warn "已取消"; return 0; }
+    svc_stop_disable fail2ban || return 1
+    pkg_remove_present fail2ban fail2ban-server fail2ban-openrc || return 1
+    hash -r
+    if command -v fail2ban-server >/dev/null 2>&1; then
+        log_error "仍检测到 fail2ban-server: $(command -v fail2ban-server)"
+        return 1
     fi
-    log_info "Fail2Ban 已卸载"
+    svc_remove_unit fail2ban || return 1
+    remove_module_paths "$FAIL2BAN_JAILS_FILE" /etc/fail2ban /etc/default/fail2ban \
+        /etc/sysconfig/fail2ban /etc/conf.d/fail2ban /etc/logrotate.d/fail2ban \
+        /var/lib/fail2ban /run/fail2ban /var/log/fail2ban /var/log/fail2ban.log /var/log/fail2ban.log.* ||
+        return 1
+    log_info "Fail2Ban 已完全卸载"
 }
 
 # 日志后端: systemd 用 journal, 其他 init 用文件轮询
@@ -1534,7 +1715,7 @@ fail2ban_disable() {
         log_warn "Fail2Ban 未安装"
         return 0
     fi
-    svc_stop_disable fail2ban
+    svc_stop_disable fail2ban || return 1
     log_info "Fail2Ban 已停止并取消开机自启"
 }
 
@@ -1660,7 +1841,7 @@ acme_status() {
 }
 
 acme_cron_enabled() {
-    crontab -l 2>/dev/null | grep -q "acme.sh --cron"
+    crontab -l 2>/dev/null | cron_job_filter "$ACME_BIN" check --cron
 }
 
 acme_install() {
@@ -1683,22 +1864,33 @@ acme_install() {
         return 1
     fi
     # 新版 acme.sh 默认 CA 是 ZeroSSL, 需要注册账号; 统一切到 Let's Encrypt
-    "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1
-    mkdir -p "$ACME_CERT_DIR"
+    "$ACME_BIN" --set-default-ca --server letsencrypt && mkdir -p "$ACME_CERT_DIR" ||
+        { log_error "acme.sh 已安装，初始化默认 CA 或证书目录失败"; return 1; }
     log_info "acme.sh 安装完成, 默认 CA 已设为 Let's Encrypt"
+}
+
+acme_has_residue() {
+    any_path_exists "$ACME_HOME" "$ACME_CERT_DIR" || acme_cron_enabled
 }
 
 acme_uninstall() {
     printf "${BLUE}=== 卸载 acme.sh ===${NC}\n"
-    if ! acme_installed; then
+    if ! acme_has_residue; then
         log_warn "acme.sh 未安装, 无需卸载"
         return 0
     fi
-    confirm "确认卸载 acme.sh? (已签发的证书文件会保留)" || { log_warn "已取消"; return 0; }
-    "$ACME_BIN" --uninstall >/dev/null 2>&1 || true
-    rm -rf "$ACME_HOME"
-    log_info "acme.sh 已卸载"
-    log_warn "证书文件仍在 $ACME_CERT_DIR, 如需清理请手动删除"
+    if [ -d "$ACME_CERT_DIR" ]; then
+        log_warn "卸载会删除 $ACME_CERT_DIR 下的证书和私钥。引用这些文件的服务需要先切换证书。"
+    fi
+    confirm "确认卸载 acme.sh，并删除账户、证书和私钥?" || { log_warn "已取消"; return 0; }
+    cron_replace_job "$ACME_BIN" --cron "" ||
+        { log_error "无法清理 acme.sh 续期任务"; return 1; }
+    if acme_installed && ! "$ACME_BIN" --uninstall --nocron; then
+        log_error "acme.sh 卸载失败"
+        return 1
+    fi
+    remove_module_paths "$ACME_HOME" "$ACME_CERT_DIR" || return 1
+    log_info "acme.sh、续期任务及本地证书已清理"
 }
 
 # 白名单防火墙开启时, LE 验证机的 IP 不在 set 里, 80 端口对它不可达
@@ -1974,15 +2166,22 @@ singbox_install() {
         return 0
     fi
     (
-        set -e
         if ! command -v curl >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
             pkg_update >/dev/null 2>&1 || true
-            pkg_install curl openssl ca-certificates >/dev/null 2>&1
+            pkg_install curl openssl ca-certificates || exit 1
         fi
-        curl -fsSL https://sing-box.app/install.sh | sh
+        if [ "$OS_FAMILY" = alpine ]; then
+            pkg_install sing-box || exit 1
+        else
+            installer_dir=$(mktemp -d) || exit 1
+            trap 'rm -rf "$installer_dir"' EXIT
+            cd "$installer_dir" || exit 1
+            curl -fsSL https://sing-box.app/install.sh -o install.sh && sh install.sh ||
+                { log_error "Sing-Box 官方安装脚本执行失败"; exit 1; }
+        fi
         if command -v sing-box >/dev/null 2>&1; then
+            singbox_ensure_service || exit 1
             log_info "Sing-Box 安装成功"
-            singbox_ensure_service
         else
             log_error "Sing-Box 安装失败"
             exit 1
@@ -1990,22 +2189,62 @@ singbox_install() {
     )
 }
 
+singbox_systemd_instances() (
+    [ "$INIT_SYS" = "systemd" ] || return 0
+    active_units=$(systemctl list-units --all --plain --no-legend 'sing-box@*.service') || return 1
+    installed_units=$(systemctl list-unit-files --no-legend 'sing-box@*.service') || return 1
+    printf '%s\n' "$active_units" "$installed_units" |
+        awk '$1 ~ /^sing-box@.+\.service$/ && $2 != "not-found" && !seen[$1]++ { sub(/\.service$/, "", $1); print $1 }'
+)
+
+singbox_has_residue() {
+    command -v sing-box >/dev/null 2>&1 || svc_has_residue sing-box || svc_has_residue sing-box@ ||
+        pkg_any_present $SINGBOX_PACKAGES || [ -e "$SINGBOX_DIR" ] || [ -e "$SINGBOX_STATE_DIR" ] ||
+        any_path_exists /var/cache/sing-box /var/log/sing-box /var/log/sing-box.log /var/log/sing-box.log.* ||
+        [ -n "$(singbox_systemd_instances 2>/dev/null)" ]
+}
+
 singbox_uninstall() {
     printf "${BLUE}=== 卸载 Sing-Box ===${NC}\n"
-    if ! command -v sing-box >/dev/null 2>&1; then
+    if ! singbox_has_residue; then
         log_warn "Sing-Box 未安装, 无需卸载"
         return 0
     fi
-    confirm "确认卸载 Sing-Box?" || { log_warn "已取消"; return 0; }
-    svc_remove_unit sing-box
-    pkg_remove sing-box >/dev/null 2>&1 || true
-    rm -f /usr/local/bin/sing-box /usr/bin/sing-box
-    rm -rf "$SINGBOX_DIR"
-    if command -v sing-box >/dev/null 2>&1; then
-        log_error "卸载未完全, 请手动清理"
-    else
-        log_info "Sing-Box 已卸载"
+    confirm "确认卸载 Sing-Box 及其实例，并删除代理配置、备份、状态和日志?" || { log_warn "已取消"; return 0; }
+    singbox_instances=$(singbox_systemd_instances) || { log_error "无法检查 Sing-Box 实例"; return 1; }
+    for singbox_instance in $singbox_instances; do
+        svc_stop_disable "$singbox_instance" || return 1
+    done
+    svc_stop_disable sing-box || return 1
+    pkg_remove_present $SINGBOX_PACKAGES || return 1
+    remove_standalone_files /usr/local/bin/sing-box /usr/local/sbin/sing-box \
+        /usr/bin/sing-box /usr/sbin/sing-box /opt/sing-box/sing-box "$SINGBOX_DIR/sing-box" || return 1
+    hash -r
+    while singbox_path=$(command -v sing-box); do
+        case "$singbox_path" in
+            /*/sing-box) remove_standalone_files "$singbox_path" || return 1 ;;
+            *) log_error "无法清理 sing-box 路径: $singbox_path"; return 1 ;;
+        esac
+        hash -r
+    done
+    for singbox_instance in $singbox_instances; do
+        remove_module_paths "$SINGBOX_STATE_DIR-${singbox_instance#sing-box@}" || return 1
+        svc_remove_unit "$singbox_instance" || return 1
+    done
+    # 旧版可能先删掉实例 unit，实例配置仍能用来定位对应的缓存目录。
+    for singbox_instance_conf in "$SINGBOX_DIR"/*.json; do
+        [ -f "$singbox_instance_conf" ] || continue
+        singbox_instance_name=${singbox_instance_conf##*/}
+        remove_module_paths "$SINGBOX_STATE_DIR-${singbox_instance_name%.json}" || return 1
+    done
+    if [ "$INIT_SYS" = "systemd" ]; then
+        svc_remove_unit sing-box@ || return 1
     fi
+    svc_remove_unit sing-box || return 1
+    remove_module_paths "$SINGBOX_STATE_DIR" /var/cache/sing-box /var/log/sing-box \
+        /var/log/sing-box.log /var/log/sing-box.log.* \
+        /etc/default/sing-box /etc/conf.d/sing-box /run/sing-box "$SINGBOX_DIR" || return 1
+    log_info "Sing-Box 已完全卸载"
 }
 
 singbox_restart() {
@@ -2014,7 +2253,7 @@ singbox_restart() {
         log_error "配置文件格式错误！"
         return 1
     fi
-    singbox_ensure_service
+    singbox_ensure_service || return 1
     svc_enable sing-box >/dev/null 2>&1 || true
     svc_restart sing-box
     sleep 2
@@ -2306,9 +2545,9 @@ singbox_delete_proxy() {
         return 0
     fi
     confirm "确认删除当前代理配置并停止服务?" || { log_warn "已取消"; return 0; }
-    svc_stop_disable sing-box
-    cp "$SINGBOX_CONFIG" "${SINGBOX_CONFIG}.bak.$(date +%s)" 2>/dev/null || true
-    rm -f "$SINGBOX_CONFIG"
+    svc_stop_disable sing-box || return 1
+    cp -p "$SINGBOX_CONFIG" "${SINGBOX_CONFIG}.bak.$(date +%s)" &&
+        rm -f "$SINGBOX_CONFIG" || { log_error "代理配置备份或删除失败"; return 1; }
     log_info "代理已删除 (服务已停止), 原 config.json 已备份"
 }
 
@@ -2790,18 +3029,23 @@ nft_get_whitelist() {
     if ! nft_set_exists; then
         return 0
     fi
-    nft list set inet "$NFT_TABLE" admin_ip4 2>/dev/null \
+    nft_whitelist_set=$(nft list set inet "$NFT_TABLE" admin_ip4) || return 1
+    printf '%s\n' "$nft_whitelist_set" \
         | tr '\n' ' ' \
         | sed -nE 's/.*elements[[:space:]]*=[[:space:]]*\{([^}]*)\}.*/\1/p' \
         | tr ',' '\n' \
-        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
-        | grep -E '^[0-9].*'
+        | sed -n 's/^[[:space:]]*//;s/[[:space:]]*$//;/^[0-9]/p'
 }
 
 # 把当前白名单备份到独立文件 (set 不存在时保持原备份不动)
 nft_save_whitelist_file() {
     nft_set_exists || return 0
-    nft_get_whitelist > "$NFT_WL_FILE"
+    whitelist_entries=$(nft_get_whitelist) || return 1
+    if [ -n "$whitelist_entries" ]; then
+        printf '%s\n' "$whitelist_entries" > "$NFT_WL_FILE"
+    else
+        : > "$NFT_WL_FILE"
+    fi
 }
 
 # 从备份文件恢复白名单到 set
@@ -2881,13 +3125,12 @@ nft_persist() (
     mkdir -p "$(dirname "$NFT_CONF")" || return 1
     nft_save_tmp=$(mktemp "${NFT_CONF}.XXXXXX") || return 1
     trap 'rm -f "$nft_save_tmp"' EXIT
-    if ! { printf '#!/usr/sbin/nft -f\n\nflush ruleset\n\n' &&
-        nft list ruleset; } > "$nft_save_tmp" ||
+    if ! { printf '#!/usr/sbin/nft -f\n# managed-by-setup.sh-nftables\n\nflush ruleset\n\n' &&
+        nft list ruleset; } > "$nft_save_tmp" || ! nft_save_whitelist_file ||
         ! mv -f "$nft_save_tmp" "$NFT_CONF"; then
         log_error "无法保存 nftables 规则到 $NFT_CONF"
         return 1
     fi
-    nft_save_whitelist_file
     log_info "ruleset 已持久化到 $NFT_CONF"
 )
 
@@ -2965,7 +3208,19 @@ nft_forward_batch() {
         printf 'delete table inet setup_port_forward\n'
     fi
     if nft list chain inet "$NFT_TABLE" setup_port_forward >/dev/null 2>&1; then
+        if [ "$2" = purge ]; then
+            forward_parent=$(nft -a list chain inet "$NFT_TABLE" forward) || return 1
+            printf '%s\n' "$forward_parent" | awk -v table="$NFT_TABLE" '
+                /(^|[[:space:]])jump setup_port_forward([[:space:]]|$)/ &&
+                    $(NF-1) == "handle" && $NF ~ /^[0-9]+$/ {
+                    print "delete rule inet " table " forward handle " $NF
+                }
+            ' || return 1
+        fi
         printf 'flush chain inet %s setup_port_forward\n' "$NFT_TABLE"
+        if [ "$2" = purge ]; then
+            printf 'delete chain inet %s setup_port_forward\n' "$NFT_TABLE"
+        fi
         forward_whitelist=yes
     elif nft list chain inet "$NFT_TABLE" forward >/dev/null 2>&1; then
         forward_whitelist=yes
@@ -3059,6 +3314,20 @@ nft_forward_start() {
 
 nft_forward_stop() {
     nft_forward_commit "$NFT_FORWARD_RULES" disabled && log_info "已停用转发，规则配置已保留"
+}
+
+nft_forward_has_residue() {
+    [ -e "$NFT_FORWARD_RULES" ] || [ -e "$NFT_FORWARD_SYSCTL" ] || nft_forward_active ||
+        nft list chain inet "$NFT_TABLE" setup_port_forward >/dev/null 2>&1
+}
+
+nft_forward_uninstall() {
+    confirm "确认完全移除 nftables 转发，并删除保存的转发规则?" ||
+        { log_warn "已取消"; return 0; }
+    command -v nft >/dev/null 2>&1 || { log_error "需要 nft 命令才能清理内核及开机转发规则"; return 1; }
+    nft_forward_commit "$NFT_FORWARD_RULES" purge &&
+        remove_module_paths "$NFT_FORWARD_RULES" || return 1
+    log_info "nftables 转发规则和开机配置已完全清理"
 }
 
 nft_forward_edit() (
@@ -3173,21 +3442,67 @@ nft_install() {
         return 0
     fi
     pkg_update
-    pkg_install nftables
+    pkg_install nftables && command -v nft >/dev/null 2>&1 ||
+        { log_error "nftables 安装失败"; return 1; }
     svc_enable nftables >/dev/null 2>&1 || true
     log_info "nftables 安装完成"
 }
 
+nft_has_residue() {
+    command -v nft >/dev/null 2>&1 || pkg_any_present nftables nftables-openrc ||
+        svc_has_residue nftables || [ -e "$NFT_WL_FILE" ] || nft_forward_has_residue ||
+        any_path_exists /etc/nftables /etc/nftables.d /etc/nftables.conf /etc/nftables.conf.* \
+            /etc/nftables.nft /etc/nftables.nft.* /etc/sysconfig/nftables.conf /etc/sysconfig/nftables.conf.* \
+            /etc/conf.d/nftables /etc/conf.d/nftables.*
+}
+
 nft_uninstall() {
     printf "${BLUE}=== 卸载 nftables ===${NC}\n"
-    if ! command -v nft >/dev/null 2>&1; then
+    if ! nft_has_residue; then
         log_warn "nftables 未安装, 无需卸载"
         return 0
     fi
-    confirm "确认卸载 nftables?" || { log_warn "已取消"; return 0; }
-    svc_stop_disable nftables
-    pkg_remove nftables
-    log_info "nftables 已卸载"
+    if command -v nft >/dev/null 2>&1; then
+        nft_uninstall_tables=$(nft list tables) || { log_error "无法检查现有 nftables 规则"; return 1; }
+        nft_other_tables=$(printf '%s\n' "$nft_uninstall_tables" |
+            awk -v whitelist="$NFT_TABLE" 'NF && !($1 == "table" && $2 == "inet" && ($3 == whitelist || $3 == "setup_port_forward"))')
+        if [ -n "$nft_other_tables" ]; then
+            log_error "仍有其他服务管理的 nftables 规则，卸载会影响这些规则"
+            printf '%s\n' "$nft_other_tables"
+            return 1
+        fi
+    fi
+    confirm "确认卸载 nftables，并删除防火墙配置、白名单和保存的转发规则?" ||
+        { log_warn "已取消"; return 0; }
+    resolve_nft_conf
+    nft_uninstall_conf="$NFT_CONF"
+    if command -v nft >/dev/null 2>&1; then
+        if nft_forward_has_residue; then
+            nft_forward_commit "$NFT_FORWARD_RULES" purge || return 1
+        fi
+        if nft_table_exists; then
+            firewall_disable || return 1
+        fi
+    else
+        log_warn "当前缺少 nft 命令，无法检查内核中的规则"
+    fi
+    svc_stop_disable nftables || return 1
+    pkg_remove_present nftables nftables-openrc || return 1
+    hash -r
+    if command -v nft >/dev/null 2>&1; then
+        log_error "仍检测到 nft: $(command -v nft)"
+        return 1
+    fi
+    svc_remove_unit nftables || return 1
+    if [ -f "$nft_uninstall_conf" ] && grep -qxF '# managed-by-setup.sh-nftables' "$nft_uninstall_conf"; then
+        remove_standalone_files "$nft_uninstall_conf" || return 1
+    fi
+    remove_module_paths "$NFT_WL_FILE" "$NFT_FORWARD_RULES" "$NFT_FORWARD_SYSCTL" \
+        /etc/nftables /etc/nftables.d || return 1
+    for nft_default_conf in /etc/nftables.conf /etc/nftables.nft /etc/sysconfig/nftables.conf /etc/conf.d/nftables; do
+        remove_standalone_files "$nft_default_conf" "$nft_default_conf".* || return 1
+    done
+    log_info "nftables 软件包和本地配置已清理"
 }
 
 firewall_enable() {
@@ -3218,7 +3533,7 @@ firewall_enable() {
         log_warn "⚠️ 白名单 set 为空, 你将无法远程访问! 请立即添加你的 IP"
     fi
 
-    nft_persist
+    nft_persist || return 1
     if ! svc_enable_now nftables >/dev/null 2>&1; then
         log_error "nftables 服务启动失败, 请检查: $(svc_status_hint nftables)"
         return 1
@@ -3233,10 +3548,9 @@ firewall_disable() {
         return 0
     fi
     if nft_table_exists; then
-        nft_save_whitelist_file
-        nft delete table inet "$NFT_TABLE"
+        nft_save_whitelist_file && nft delete table inet "$NFT_TABLE" && nft_persist ||
+            { log_error "禁用或保存防火墙规则失败"; return 1; }
         log_info "已移除 table inet ${NFT_TABLE}"
-        nft_persist
         if [ -s "$NFT_WL_FILE" ]; then
             log_info "白名单已保存到 $NFT_WL_FILE (共 $(grep -c . "$NFT_WL_FILE") 个 IP), 重新启用时自动恢复"
         fi
@@ -3253,10 +3567,11 @@ nft_clear() {
     fi
     log_warn "⚠️ 此操作会清空所有 nft 规则, 包括你手动添加的其他 table"
     confirm "确认清空所有 nftables 规则?" || { log_warn "已取消"; return 0; }
-    nft_save_whitelist_file
-    nft flush ruleset
+    nft_save_whitelist_file && nft flush ruleset ||
+        { log_error "备份白名单或清空 nftables 规则失败"; return 1; }
     resolve_nft_conf
-    : > "$NFT_CONF"
+    : > "$NFT_CONF" && rm -f "$NFT_FORWARD_SYSCTL" ||
+        { log_error "清理持久化配置失败"; return 1; }
     log_info "已清空 nftables 全部规则"
     if [ -s "$NFT_WL_FILE" ]; then
         log_info "白名单已保存到 $NFT_WL_FILE, 重新启用防火墙时自动恢复"
@@ -3404,6 +3719,8 @@ whitelist_modify() {
 TCP_TUNE_CONF="/etc/sysctl.d/99-bbr-direct-manual.conf"
 BBR_PERSIST_NAME="bbr-optimize-persist"
 BBR_PERSIST_SCRIPT="/usr/local/bin/bbr-optimize-apply.sh"
+BBR_LIMITS_CONF="/etc/security/limits.d/99-setup-bbr.conf"
+BBR_LEGACY_LIMITS_CONF="/etc/security/limits.conf"
 BBR_BUFFER_MAX_MB=128
 BBR_BUFFER_MULTIPLIER="2.5"
 
@@ -3508,17 +3825,6 @@ _bbr_calc_buffer_mb() {
     '
 }
 
-_bbr_clean_sysctl_conf() {
-    if [ -f /etc/sysctl.conf ] && [ ! -f /etc/sysctl.conf.bak.original ]; then
-        cp /etc/sysctl.conf /etc/sysctl.conf.bak.original
-    fi
-    if [ -f /etc/sysctl.conf ]; then
-        for key in net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.core.default_qdisc net.ipv4.tcp_congestion_control; do
-            sed -i "/^${key}/s/^/# /" /etc/sysctl.conf 2>/dev/null || true
-        done
-    fi
-}
-
 _bbr_check_conflicts() {
     log_info "检查 sysctl 配置冲突..."
     conflicts=""
@@ -3546,16 +3852,6 @@ ${conf}"
 
     log_warn "发现可能覆盖本脚本的配置:"
     echo "$conflicts" | sed 's/^/  - /'
-    if confirm "是否自动禁用这些冲突文件?" y; then
-        ts=$(date +%Y%m%d_%H%M%S)
-        echo "$conflicts" | while IFS= read -r conf; do
-            [ -z "$conf" ] && continue
-            mv "$conf" "${conf}.disabled.${ts}" 2>/dev/null || true
-        done
-        log_info "已禁用冲突文件"
-    else
-        log_warn "已跳过, 若配置未生效请手动检查 /etc/sysctl.d/"
-    fi
 }
 
 _bbr_eligible_ifaces() {
@@ -3589,7 +3885,18 @@ _bbr_apply_mss_clamp() {
         return 0
     fi
     iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 \
-        || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+        || iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --comment setup.sh-bbr \
+               -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 \
+        || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --comment setup.sh-bbr \
+               -j TCPMSS --clamp-mss-to-pmtu
+}
+
+_bbr_remove_mss_clamp() {
+    command -v iptables >/dev/null 2>&1 || return 0
+    set -- -p tcp --tcp-flags SYN,RST SYN -m comment --comment setup.sh-bbr -j TCPMSS --clamp-mss-to-pmtu
+    while iptables -t mangle -C FORWARD "$@" >/dev/null 2>&1; do
+        iptables -t mangle -D FORWARD "$@" || return 1
+    done
 }
 
 # 持久化服务是否已由本脚本写入 (runit 的 oneshot 落在 rc.local)
@@ -3599,7 +3906,7 @@ _bbr_persist_present() {
 }
 
 _bbr_install_persist() {
-    cat > "$BBR_PERSIST_SCRIPT" <<'EOF'
+    cat > "$BBR_PERSIST_SCRIPT" <<'EOF' || return 1
 #!/bin/sh
 for d in /sys/class/net/*; do
     [ -e "$d" ] || continue
@@ -3612,7 +3919,10 @@ done
 
 if command -v iptables >/dev/null 2>&1; then
     iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 \
-        || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+        || iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --comment setup.sh-bbr \
+               -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 \
+        || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --comment setup.sh-bbr \
+               -j TCPMSS --clamp-mss-to-pmtu
 fi
 
 if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
@@ -3627,7 +3937,11 @@ fi
 
 cpu_count=$(nproc 2>/dev/null || echo 1)
 if [ "$cpu_count" -gt 1 ]; then
-    rps_mask=$(printf '%x' $((2**cpu_count - 1)))
+    rps_mask=$(awk -v cpus="$cpu_count" 'BEGIN {
+        groups = int((cpus - 1) / 32)
+        printf "%x", 2 ^ (cpus - groups * 32) - 1
+        for (i = 0; i < groups; i++) printf ",ffffffff"
+    }')
     flow_entries=$((4096 * cpu_count))
     echo "$flow_entries" > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
     for d in /sys/class/net/*; do
@@ -3647,9 +3961,10 @@ if [ "$cpu_count" -gt 1 ]; then
 fi
 EOF
 
-    chmod +x "$BBR_PERSIST_SCRIPT"
-    svc_write_unit "$BBR_PERSIST_NAME" "BBR Optimize - Restore tc fq and MSS clamp after boot" "$BBR_PERSIST_SCRIPT" oneshot
-    svc_enable "$BBR_PERSIST_NAME" >/dev/null 2>&1 || true
+    chmod +x "$BBR_PERSIST_SCRIPT" &&
+        svc_write_unit "$BBR_PERSIST_NAME" "BBR Optimize - Restore tc fq and MSS clamp after boot" "$BBR_PERSIST_SCRIPT" oneshot ||
+        return 1
+    [ "$INIT_SYS" = "runit" ] || svc_enable "$BBR_PERSIST_NAME"
 }
 
 bbr_apply() {
@@ -3681,8 +3996,6 @@ bbr_apply() {
 
     confirm "确认应用?" y || { log_warn "已取消"; return 0; }
 
-    _bbr_clean_sysctl_conf
-    [ -L /etc/sysctl.d/99-sysctl.conf ] && rm -f /etc/sysctl.d/99-sysctl.conf
     _bbr_check_conflicts
 
     mem_total=$(free -m | awk 'NR==2{print $2}')
@@ -3695,7 +4008,7 @@ bbr_apply() {
         vm_min_free_kbytes=32768
     fi
 
-    cat > "$TCP_TUNE_CONF" <<EOF
+    cat > "$TCP_TUNE_CONF" <<EOF || return 1
 # BBR Direct/Endpoint Configuration (Manual Bandwidth/Latency)
 # Generated on $(date)
 # Bandwidth: ${BBR_BANDWIDTH} Mbps | Latency: ${BBR_LATENCY} ms | Buffer: ${buffer_mb} MB
@@ -3747,10 +4060,11 @@ EOF
 
     _bbr_apply_tc_fq
     _bbr_apply_mss_clamp
-    _bbr_install_persist
+    _bbr_install_persist || { log_error "无法设置 BBR 开机持久化"; return 1; }
 
-    if ! grep -q "BBR - 文件描述符优化" /etc/security/limits.conf 2>/dev/null; then
-        cat >> /etc/security/limits.conf <<'EOF'
+    if ! grep -qxF "# BBR - 文件描述符优化" "$BBR_LEGACY_LIMITS_CONF" 2>/dev/null; then
+        mkdir -p /etc/security/limits.d || return 1
+        cat > "$BBR_LIMITS_CONF" <<'EOF' || return 1
 # BBR - 文件描述符优化
 * soft nofile 524288
 * hard nofile 524288
@@ -3780,29 +4094,49 @@ EOF
 
 bbr_remove() {
     printf "${BLUE}=== 移除 BBR / TCP 调优 ===${NC}\n"
-    if [ ! -f "$TCP_TUNE_CONF" ] && ! _bbr_persist_present; then
+    if ! bbr_has_config; then
         log_warn "未检测到本脚本的调优配置, 无需移除"
         return 0
     fi
     confirm "确认移除?" || { log_warn "已取消"; return 0; }
 
-    if [ -f "$TCP_TUNE_CONF" ]; then
-        rm -f "$TCP_TUNE_CONF"
-        log_info "已删除 $TCP_TUNE_CONF"
-    fi
     if _bbr_persist_present; then
-        svc_remove_unit "$BBR_PERSIST_NAME"
+        svc_remove_unit "$BBR_PERSIST_NAME" || return 1
         log_info "已移除开机持久化服务 $BBR_PERSIST_NAME"
     fi
-    if [ -f "$BBR_PERSIST_SCRIPT" ]; then
-        rm -f "$BBR_PERSIST_SCRIPT"
-        log_info "已移除 $BBR_PERSIST_SCRIPT"
-    fi
-
-    svc_daemon_reload
-    sysctl --system >/dev/null 2>&1 || true
-    log_info "完成. 部分内核参数 (如 tcp_rmem) 可能需要重启才能完全回退"
+    _bbr_remove_mss_clamp || { log_error "无法清理 BBR 的 MSS 规则"; return 1; }
+    remove_standalone_files "$TCP_TUNE_CONF" "$BBR_PERSIST_SCRIPT" "$BBR_LIMITS_CONF" || return 1
+    bbr_remove_legacy_limits || { log_error "无法清理旧版 BBR 文件描述符配置"; return 1; }
+    log_info "已移除开机调优配置，重启后按系统剩余配置重新加载内核参数与队列设置"
 }
+
+bbr_has_config() {
+    [ -f "$TCP_TUNE_CONF" ] || [ -f "$BBR_PERSIST_SCRIPT" ] ||
+        [ -f "$BBR_LIMITS_CONF" ] || _bbr_persist_present || bbr_has_legacy_limits
+}
+
+bbr_has_legacy_limits() {
+    grep -qxF "# BBR - 文件描述符优化" "$BBR_LEGACY_LIMITS_CONF" 2>/dev/null
+}
+
+bbr_remove_legacy_limits() (
+    bbr_has_legacy_limits || return 0
+    limits_tmp=$(mktemp) || return 1
+    trap 'rm -f "$limits_tmp"' EXIT
+    awk '
+        $0 == "# BBR - 文件描述符优化" {
+            marker = $0
+            if ((getline soft) != 1) { print marker; next }
+            if ((getline hard) != 1) { print marker; print soft; next }
+            if (soft != "* soft nofile 524288" || hard != "* hard nofile 524288") {
+                print marker; print soft; print hard
+            }
+            next
+        }
+        { print }
+    ' "$BBR_LEGACY_LIMITS_CONF" > "$limits_tmp" &&
+        cat "$limits_tmp" > "$BBR_LEGACY_LIMITS_CONF"
+)
 
 tcp_view_params() {
     printf "${CYAN}--- 当前 TCP / 网络相关参数 ---${NC}\n"
@@ -4023,7 +4357,10 @@ realm_install() {
         return 1
     fi
 
-    install -m 0755 "$tmpdir/realm" /usr/local/bin/realm
+    if ! install -m 0755 "$tmpdir/realm" /usr/local/bin/realm; then
+        rm -rf "$tmpdir"
+        return 1
+    fi
     rm -rf "$tmpdir"
     log_info "已安装到 /usr/local/bin/realm"
 
@@ -4044,28 +4381,54 @@ EOF
     # 服务定义 (使用检测到或默认的配置路径, 按当前 init 系统生成)
     realm_detect
     cfg_for_service="${REALM_CFG:-/etc/realm/config.toml}"
-    svc_write_unit realm "Realm relay" "/usr/local/bin/realm -c ${cfg_for_service}"
+    svc_write_unit realm "Realm relay" "/usr/local/bin/realm -c ${cfg_for_service}" || return 1
     log_info "完成. 下一步: '配置转发规则 -> 添加', 再 '启用 realm'"
 }
 
 realm_uninstall() {
     printf "${BLUE}=== 卸载 realm ===${NC}\n"
     realm_detect
-    if [ -z "$REALM_BIN" ] && [ -z "$REALM_SERVICE" ]; then
+    if ! realm_has_residue; then
         log_warn "未检测到 realm 安装"
         return 0
     fi
-    confirm "确认卸载 realm?" || { log_warn "已取消"; return 0; }
+    confirm "确认卸载 Realm，并删除 /opt/realm 和 /etc/realm 中的配置及备份?" || { log_warn "已取消"; return 0; }
 
-    if [ -n "$REALM_SERVICE" ] && [ "$REALM_SERVICE" != "realm" ]; then
-        svc_remove_unit "$REALM_SERVICE"
+    if [ -n "$REALM_SERVICE" ]; then
+        svc_stop_disable "$REALM_SERVICE" || return 1
     fi
-    svc_remove_unit realm
+    pkg_remove_present realm || return 1
+    while [ -n "$REALM_SERVICE" ]; do
+        realm_removed_service="$REALM_SERVICE"
+        svc_remove_unit "$realm_removed_service" || return 1
+        realm_detect
+        if [ "$REALM_SERVICE" = "$realm_removed_service" ]; then
+            log_error "仍检测到 Realm 服务: $REALM_SERVICE"
+            return 1
+        fi
+    done
+    if svc_has_residue realm; then
+        svc_remove_unit realm || return 1
+    fi
+    case "$REALM_BIN" in
+        /*/realm) remove_standalone_files "$REALM_BIN" || return 1 ;;
+    esac
+    remove_standalone_files /usr/local/bin/realm /usr/bin/realm /opt/realm/realm /etc/realm/realm || return 1
+    hash -r
+    realm_detect
+    if [ -n "$REALM_BIN" ] || [ -n "$REALM_SERVICE" ]; then
+        log_error "仍检测到 Realm 实体: ${REALM_BIN:-无二进制} ${REALM_SERVICE:-无服务}"
+        return 1
+    fi
 
-    [ -n "$REALM_BIN" ] && rm -f "$REALM_BIN"
-    rm -f /usr/local/bin/realm /usr/bin/realm /opt/realm/realm /etc/realm/realm
+    remove_module_paths /opt/realm /etc/realm /var/lib/realm /var/log/realm /run/realm \
+        /etc/default/realm /etc/conf.d/realm || return 1
+    log_info "Realm 已完全卸载"
+}
 
-    log_info "二进制和 service 已删除. 配置目录 (/opt/realm, /etc/realm) 保留, 如需清理请手动 rm -rf"
+realm_has_residue() {
+    [ -n "$REALM_BIN" ] || [ -n "$REALM_SERVICE" ] || pkg_present realm ||
+        svc_has_residue realm || any_path_exists /opt/realm /etc/realm /var/lib/realm /var/log/realm
 }
 
 realm_enable() {
@@ -4103,7 +4466,7 @@ realm_disable() {
         log_warn "未找到 realm service"
         return 0
     fi
-    svc_stop_disable "$REALM_SERVICE"
+    svc_stop_disable "$REALM_SERVICE" || return 1
     log_info "realm 已停止并取消开机自启"
 }
 
@@ -4354,7 +4717,12 @@ ddns_log_path() {
 
 ddns_cron_enabled() {
     command -v crontab >/dev/null 2>&1 || return 1
-    crontab -l 2>/dev/null | grep -q "ddns.sh"
+    crontab -l 2>/dev/null | cron_job_filter "$DDNS_SCRIPT" check ""
+}
+
+ddns_has_installation() {
+    any_path_exists "$DDNS_SCRIPT" "$DDNS_TOKEN_FILE" "$DDNS_ZONE_FILE" "$DDNS_LOG" "$DDNS_LOG".* ||
+        ddns_cron_enabled
 }
 
 ddns_status() {
@@ -4438,9 +4806,9 @@ ddns_install() {
     if [ -n "$need_pkgs" ]; then
         log_info "安装依赖:$need_pkgs"
         pkg_update
-        pkg_install $need_pkgs
+        pkg_install $need_pkgs || return 1
     fi
-    ensure_cron
+    ensure_cron || return 1
 
     read_input "请输入完整域名 (如 home.example.com)" "" DDNS_DOMAIN
     if [ -z "$DDNS_DOMAIN" ]; then log_warn "已取消"; return 0; fi
@@ -4551,8 +4919,8 @@ ddns_install() {
     fi
 
     # 持久化配置
-    echo "$DDNS_TOKEN" > "$DDNS_TOKEN_FILE"
-    chmod 600 "$DDNS_TOKEN_FILE"
+    (umask 077; printf '%s\n' "$DDNS_TOKEN" > "$DDNS_TOKEN_FILE") &&
+        chmod 600 "$DDNS_TOKEN_FILE" || { log_error "无法保存 DDNS Token"; return 1; }
     touch "$DDNS_LOG" 2>/dev/null || true
     chmod 644 "$DDNS_LOG" 2>/dev/null || true
 
@@ -4563,10 +4931,10 @@ ddns_install() {
         echo "PROXIED=${DDNS_PROXIED}"
         echo "TTL=${DDNS_TTL}"
         echo "LOG=${DDNS_LOG}"
-    } > "$DDNS_ZONE_FILE"
+    } > "$DDNS_ZONE_FILE" || return 1
 
     # 写入执行脚本
-    cat > "$DDNS_SCRIPT" <<'DDNS_INNER'
+    cat > "$DDNS_SCRIPT" <<'DDNS_INNER' || return 1
 #!/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -4659,21 +5027,24 @@ update_record() {
     fi
 }
 
-update_record A "$CURRENT_IP4"
+update_failed=0
+update_record A "$CURRENT_IP4" || update_failed=1
 if [ "$MODE" = "dual" ] && [ -n "$CURRENT_IP6" ]; then
-    update_record AAAA "$CURRENT_IP6"
+    update_record AAAA "$CURRENT_IP6" || update_failed=1
 fi
+exit "$update_failed"
 DDNS_INNER
 
-    sed -i "s|__DOMAIN__|${DDNS_DOMAIN}|g"      "$DDNS_SCRIPT"
-    sed -i "s|__ZONE__|${DDNS_ZONE_NAME}|g"     "$DDNS_SCRIPT"
-    sed -i "s|__MODE__|${DDNS_MODE}|g"          "$DDNS_SCRIPT"
-    sed -i "s|__PROXIED__|${DDNS_PROXIED}|g"    "$DDNS_SCRIPT"
-    sed -i "s|__TTL__|${DDNS_TTL}|g"            "$DDNS_SCRIPT"
-    chmod 700 "$DDNS_SCRIPT"
+    sed -i -e "s|__DOMAIN__|${DDNS_DOMAIN}|g" \
+        -e "s|__ZONE__|${DDNS_ZONE_NAME}|g" \
+        -e "s|__MODE__|${DDNS_MODE}|g" \
+        -e "s|__PROXIED__|${DDNS_PROXIED}|g" \
+        -e "s|__TTL__|${DDNS_TTL}|g" "$DDNS_SCRIPT" &&
+        chmod 700 "$DDNS_SCRIPT" || { log_error "无法完成 DDNS 脚本配置"; return 1; }
 
     cron_job="*/5 * * * * ${DDNS_SCRIPT} >> ${DDNS_LOG} 2>&1"
-    ( crontab -l 2>/dev/null | grep -v "ddns.sh"; echo "$cron_job" ) | crontab -
+    cron_replace_job "$DDNS_SCRIPT" "" "$cron_job" ||
+        { log_error "写入 DDNS 定时任务失败"; return 1; }
     log_info "crontab 已设置 (每5分钟自动更新)"
 
     log_info "立即执行一次测试..."
@@ -4683,6 +5054,7 @@ DDNS_INNER
         done
     else
         log_error "测试执行失败, 请查看日志: $DDNS_LOG"
+        return 1
     fi
     log_info "DDNS 配置完成: $DDNS_DOMAIN"
 }
@@ -4700,6 +5072,7 @@ ddns_run_now() {
         done
     else
         log_error "更新失败, 请查看日志"
+        return 1
     fi
 }
 
@@ -4728,7 +5101,8 @@ ddns_pause() {
         log_warn "未安装 cron"
         return 0
     fi
-    ( crontab -l 2>/dev/null | grep -v "ddns.sh" ) | crontab - 2>/dev/null
+    cron_replace_job "$DDNS_SCRIPT" "" "" ||
+        { log_error "暂停 DDNS 定时任务失败"; return 1; }
     log_info "DDNS 自动更新已暂停"
 }
 
@@ -4737,25 +5111,26 @@ ddns_resume() {
         log_error "DDNS 未安装"
         return 1
     fi
-    ensure_cron
+    ensure_cron || return 1
     log=$(ddns_log_path)
     cron_job="*/5 * * * * ${DDNS_SCRIPT} >> ${log} 2>&1"
-    ( crontab -l 2>/dev/null | grep -v "ddns.sh"; echo "$cron_job" ) | crontab -
+    cron_replace_job "$DDNS_SCRIPT" "" "$cron_job" ||
+        { log_error "恢复 DDNS 定时任务失败"; return 1; }
     log_info "DDNS 自动更新已恢复 (每5分钟)"
 }
 
 ddns_uninstall() {
     printf "${BLUE}=== 卸载 DDNS ===${NC}\n"
-    if [ ! -f "$DDNS_SCRIPT" ] && [ ! -f "$DDNS_TOKEN_FILE" ] && [ ! -f "$DDNS_ZONE_FILE" ]; then
+    if ! ddns_has_installation; then
         log_warn "DDNS 未安装, 无需卸载"
         return 0
     fi
-    confirm "确认卸载 DDNS? 将移除 cron / 脚本 / Token" || { log_warn "已取消"; return 0; }
-    if command -v crontab >/dev/null 2>&1; then
-        ( crontab -l 2>/dev/null | grep -v "ddns.sh" ) | crontab - 2>/dev/null
-    fi
-    rm -f "$DDNS_SCRIPT" "$DDNS_TOKEN_FILE" "$DDNS_ZONE_FILE"
-    log_info "DDNS 已卸载 (日志文件保留: $DDNS_LOG)"
+    confirm "确认卸载 DDNS，并删除定时任务、脚本、Token 和本地日志?" || { log_warn "已取消"; return 0; }
+    cron_replace_job "$DDNS_SCRIPT" "" "" ||
+        { log_error "无法清理 DDNS 定时任务"; return 1; }
+    rm -f -- "$DDNS_SCRIPT" "$DDNS_TOKEN_FILE" "$DDNS_ZONE_FILE" "$DDNS_LOG" "$DDNS_LOG".* ||
+        { log_error "无法清理 DDNS 文件"; return 1; }
+    log_info "DDNS 已完全卸载"
 }
 
 
@@ -4887,9 +5262,9 @@ task_system_reinstall() {
     key_preview=$(printf '%s' "$SSH_KEY" | cut -c1-50)
     printf "  SSH 公钥: ${CYAN}%s...${NC} (长度: %s)\n" "$key_preview" "${#SSH_KEY}"
 
-    printf "\n${RED}⚠️  即将执行系统重装. 本次 SSH 会话稍后会断开, 几分钟后机器以新系统启动.${NC}\n"
+    printf "\n${RED}⚠️  确认后将准备重装. 准备成功后会自动重启并开始重装, 当前 SSH 会话将断开.${NC}\n"
     # 高危操作: 保留行输入强确认, 必须完整输入 yes
-    read_input "确认执行重装? 输入 yes 继续" "" CONFIRM
+    read_input "确认执行重装并自动重启? 输入 yes 继续" "" CONFIRM
     if [ "$CONFIRM" != "yes" ]; then
         log_warn "已取消"
         return 0
@@ -4923,12 +5298,17 @@ task_system_reinstall() {
     fi
 
     ret=$?
-    if [ "$ret" -eq 0 ]; then
-        log_info "reinstall.sh 执行完成. 按提示重启系统以完成 DD"
-        log_warn "重启命令: reboot"
-    else
+    if [ "$ret" -ne 0 ]; then
         log_error "reinstall.sh 返回非零退出码: $ret"
+        return "$ret"
     fi
+
+    log_info "重装准备完成, 正在重启系统以开始 DD..."
+    if reboot; then
+        exit 0
+    fi
+    log_error "自动重启失败, 可手动执行 reboot 开始重装"
+    return 1
 }
 
 # ================================================================
@@ -4982,8 +5362,8 @@ _ssh_comment_in_file() {
 ssh_config_set() {
     _key="$1"; _val="$2"
     if ssh_use_dropin; then
-        [ -f "$SSHD_DROPIN" ] || printf '# 由 setup.sh 生成, 优先级最高 (00- 前缀)\n' > "$SSHD_DROPIN"
-        _ssh_set_in_file "$SSHD_DROPIN" "$_key" "$_val"
+        [ -f "$SSHD_DROPIN" ] || printf '# 由 setup.sh 生成, 优先级最高 (00- 前缀)\n' > "$SSHD_DROPIN" || return 1
+        _ssh_set_in_file "$SSHD_DROPIN" "$_key" "$_val" || return 1
         # Port 为累加型指令 (多条 = 监听多个端口), 需注释掉主配置中的旧值
         if [ "$_key" = "Port" ]; then
             _ssh_comment_in_file "$SSHD_CONFIG" "Port"
@@ -4995,27 +5375,32 @@ ssh_config_set() {
 
 # 备份 / 恢复 sshd 配置 (校验失败时回滚)
 ssh_backup_config() {
-    cp -p "$SSHD_CONFIG" "${SSHD_CONFIG}.setup-bak" 2>/dev/null
-    [ -f "$SSHD_DROPIN" ] && cp -p "$SSHD_DROPIN" "${SSHD_DROPIN}.setup-bak"
-    return 0
+    cp -p "$SSHD_CONFIG" "${SSHD_CONFIG}.setup-bak" || return 1
+    if [ -f "$SSHD_DROPIN" ]; then
+        cp -p "$SSHD_DROPIN" "${SSHD_DROPIN}.setup-bak"
+    else
+        rm -f "${SSHD_DROPIN}.setup-bak"
+    fi
 }
 
 ssh_restore_config() {
-    [ -f "${SSHD_CONFIG}.setup-bak" ] && cat "${SSHD_CONFIG}.setup-bak" > "$SSHD_CONFIG"
+    cp -p "${SSHD_CONFIG}.setup-bak" "$SSHD_CONFIG" || return 1
     if [ -f "${SSHD_DROPIN}.setup-bak" ]; then
-        cat "${SSHD_DROPIN}.setup-bak" > "$SSHD_DROPIN"
+        cp -p "${SSHD_DROPIN}.setup-bak" "$SSHD_DROPIN"
     elif [ -f "$SSHD_DROPIN" ]; then
         rm -f "$SSHD_DROPIN"
     fi
-    return 0
 }
 
 # 重启 sshd (兼容 systemd socket 激活 / OpenRC / SysV)
 ssh_restart_service() {
     if [ "$INIT_SYS" = "systemd" ]; then
-        svc_daemon_reload
+        systemctl daemon-reload || return 1
         if systemctl is-active ssh.socket >/dev/null 2>&1; then
-            systemctl restart ssh.socket 2>/dev/null || true
+            systemctl restart ssh.socket || return 1
+            if ! svc_is_active sshd && ! svc_is_active ssh; then
+                return 0
+            fi
         fi
     fi
     svc_restart sshd >/dev/null 2>&1 || svc_restart ssh >/dev/null 2>&1
@@ -5023,14 +5408,17 @@ ssh_restart_service() {
 
 # 校验配置并重启, 失败自动回滚 (返回 1)
 ssh_validate_and_restart() {
-    err=$(sshd -t 2>&1)
-    if [ -n "$err" ]; then
-        log_error "sshd 配置校验失败, 已回滚:"
-        printf '%s\n' "$err"
-        ssh_restore_config
+    if ! sshd -t; then
+        log_error "sshd 配置校验失败，正在恢复备份"
+        ssh_restore_config || log_error "恢复 SSH 配置失败"
         return 1
     fi
-    ssh_restart_service
+    if ! ssh_restart_service; then
+        log_error "sshd 重启失败，正在恢复备份"
+        ssh_restore_config && ssh_restart_service ||
+            log_error "恢复 SSH 配置或重启服务失败"
+        return 1
+    fi
     log_info "sshd 已重启生效"
     return 0
 }
@@ -5046,19 +5434,29 @@ ssh_password_enabled() {
     [ "$v" != "no" ]
 }
 
-# 统计 authorized_keys 中的有效密钥数
+# 输出有效公钥的文件行号和原文，供查看、计数和删除共用。
+ssh_key_entries() (
+    [ -f "$AUTH_KEYS_FILE" ] || return 0
+    key_number=0
+    while IFS= read -r key_line || [ -n "$key_line" ]; do
+        key_number=$((key_number + 1))
+        if command -v ssh-keygen >/dev/null 2>&1; then
+            printf '%s\n' "$key_line" | ssh-keygen -lf - >/dev/null 2>&1 || continue
+        else
+            printf '%s\n' "$key_line" | grep -qE '^[[:space:]]*(ssh-|ecdsa-|sk-)' || continue
+        fi
+        printf '%s|%s\n' "$key_number" "$key_line"
+    done < "$AUTH_KEYS_FILE"
+)
+
 ssh_key_count() {
-    [ -f "$AUTH_KEYS_FILE" ] || { echo 0; return; }
-    _cnt=$(grep -c -E '^[[:space:]]*(ssh-|ecdsa-|sk-)' "$AUTH_KEYS_FILE" 2>/dev/null)
-    echo "${_cnt:-0}"
+    ssh_key_entries | awk 'END { print NR }'
 }
 
 # 确保 /root/.ssh 与 authorized_keys 存在且权限正确
 ssh_ensure_authkeys() {
-    mkdir -p /root/.ssh
-    chmod 700 /root/.ssh
-    touch "$AUTH_KEYS_FILE"
-    chmod 600 "$AUTH_KEYS_FILE"
+    mkdir -p /root/.ssh && chmod 700 /root/.ssh &&
+        touch "$AUTH_KEYS_FILE" && chmod 600 "$AUTH_KEYS_FILE"
 }
 
 ssh_status() {
@@ -5097,13 +5495,13 @@ ssh_status() {
 # --- 密钥配置 ---
 ssh_keys_view() {
     printf "${MAGENTA}--- 已授权密钥 (%s) ---${NC}\n" "$AUTH_KEYS_FILE"
-    if [ ! -s "$AUTH_KEYS_FILE" ]; then
+    key_entries=$(ssh_key_entries)
+    if [ -z "$key_entries" ]; then
         printf "  ${YELLOW}(暂无密钥)${NC}\n"
         return 0
     fi
     i=0
-    while IFS= read -r line; do
-        case "$line" in ''|\#*) continue ;; esac
+    while IFS='|' read -r key_number line; do
         i=$((i + 1))
         ktype=$(printf '%s' "$line" | awk '{print $1}')
         kcomment=$(printf '%s' "$line" | awk '{ if (NF >= 3) { s = $3; for (j = 4; j <= NF; j++) s = s " " $j; print s } else print "-" }')
@@ -5113,8 +5511,9 @@ ssh_keys_view() {
             fp=$(printf '%s' "$body" | cut -c1-16)"..."
         fi
         printf "  ${GREEN}%d)${NC} %-12s %s  ${CYAN}%s${NC}\n" "$i" "$ktype" "$fp" "$kcomment"
-    done < "$AUTH_KEYS_FILE"
-    [ "$i" -eq 0 ] && printf "  ${YELLOW}(暂无密钥)${NC}\n"
+    done <<EOF
+$key_entries
+EOF
     return 0
 }
 
@@ -5132,15 +5531,14 @@ ssh_key_add() {
             return 1
         fi
     fi
-    ssh_ensure_authkeys
+    ssh_ensure_authkeys || return 1
     keybody=$(printf '%s' "$pubkey" | awk '{print $2}')
     if grep -qF -- "$keybody" "$AUTH_KEYS_FILE"; then
         log_warn "该公钥已存在, 跳过"
         return 1
     fi
-    printf '%s\n' "$pubkey" >> "$AUTH_KEYS_FILE"
+    printf '%s\n' "$pubkey" >> "$AUTH_KEYS_FILE" || return 1
     log_info "公钥已添加"
-    return 1
 }
 
 ssh_key_generate() {
@@ -5148,7 +5546,7 @@ ssh_key_generate() {
         log_error "未找到 ssh-keygen, 请先安装 openssh"
         return 0
     fi
-    ssh_ensure_authkeys
+    ssh_ensure_authkeys || return 1
     ts=$(date +%Y%m%d%H%M%S)
     keyfile="/root/.ssh/setup_ed25519_$ts"
     comment="setup-$(hostname 2>/dev/null || echo vps)-$(date +%Y%m%d)"
@@ -5156,7 +5554,7 @@ ssh_key_generate() {
         log_error "密钥生成失败"
         return 0
     fi
-    cat "${keyfile}.pub" >> "$AUTH_KEYS_FILE"
+    cat "${keyfile}.pub" >> "$AUTH_KEYS_FILE" || return 1
     log_info "已生成 ed25519 密钥对, 公钥已加入 authorized_keys"
     printf "\n${YELLOW}===== 请立即复制并妥善保存以下私钥 (仅显示这一次机会) =====${NC}\n"
     cat "$keyfile"
@@ -5172,7 +5570,8 @@ ssh_key_generate() {
 }
 
 ssh_key_delete() {
-    n=$(ssh_key_count)
+    key_entries=$(ssh_key_entries)
+    n=$(printf '%s\n' "$key_entries" | awk 'NF { count++ } END { print count + 0 }')
     if [ "$n" -eq 0 ]; then
         log_warn "没有可删除的密钥"
         return 1
@@ -5186,18 +5585,21 @@ ssh_key_delete() {
         log_error "序号超出范围 (1-$n)"
         return 1
     fi
-    if [ "$n" -eq 1 ] && ! ssh_password_enabled; then
-        log_error "密码登录已关闭, 禁止删除最后一把密钥 (会导致无法登录)"
-        log_warn  "请先开启密码登录或添加新密钥"
+    if [ "$n" -eq 1 ] && { [ "$(ssh_effective passwordauthentication)" != yes ] ||
+        [ "$(ssh_effective permitrootlogin)" != yes ]; }; then
+        log_error "当前 SSH 设置不允许 root 使用密码登录，请先添加新密钥"
         return 1
     fi
-    _tmp="${AUTH_KEYS_FILE}.tmp.$$"
-    awk -v n="$idx" '
-        /^[ \t]*(#|$)/ { print; next }
-        { i++; if (i != n) print }
-    ' "$AUTH_KEYS_FILE" > "$_tmp" && cat "$_tmp" > "$AUTH_KEYS_FILE" && rm -f "$_tmp"
+    key_number=$(printf '%s\n' "$key_entries" | awk -F '|' -v n="$idx" 'NR == n { print $1 }')
+    _tmp=$(mktemp "${AUTH_KEYS_FILE}.XXXXXX") || return 1
+    if ! awk -v n="$key_number" 'NR != n' "$AUTH_KEYS_FILE" > "$_tmp" ||
+        ! cat "$_tmp" > "$AUTH_KEYS_FILE"; then
+        rm -f "$_tmp"
+        log_error "无法更新 $AUTH_KEYS_FILE"
+        return 1
+    fi
+    rm -f "$_tmp"
     log_info "密钥 #$idx 已删除"
-    return 1
 }
 
 # --- 端口配置 ---
@@ -5225,8 +5627,8 @@ ssh_port_config() {
     fi
     confirm "确认将 SSH 端口改为 $new_port?" || { log_warn "已取消"; return 0; }
 
-    ssh_backup_config
-    ssh_config_set Port "$new_port"
+    ssh_backup_config || return 1
+    ssh_config_set Port "$new_port" || { ssh_restore_config; return 1; }
     ssh_validate_and_restart || return 0
 
     printf "\n"
@@ -5252,14 +5654,14 @@ ssh_password_disable() {
         log_warn "已取消"
         return 0
     fi
-    ssh_backup_config
-    ssh_config_set PubkeyAuthentication yes
-    ssh_config_set PasswordAuthentication no
+    ssh_backup_config || return 1
+    ssh_config_set PubkeyAuthentication yes && ssh_config_set PasswordAuthentication no ||
+        { ssh_restore_config; return 1; }
     # 新版 OpenSSH 用 KbdInteractiveAuthentication, 旧版 (如 CentOS 7) 只认 ChallengeResponseAuthentication
     if sshd -T 2>/dev/null | grep -q '^kbdinteractiveauthentication'; then
-        ssh_config_set KbdInteractiveAuthentication no
+        ssh_config_set KbdInteractiveAuthentication no || { ssh_restore_config; return 1; }
     else
-        ssh_config_set ChallengeResponseAuthentication no
+        ssh_config_set ChallengeResponseAuthentication no || { ssh_restore_config; return 1; }
     fi
     ssh_validate_and_restart || return 0
     log_info "密码登录已关闭, 仅允许密钥登录"
@@ -5268,12 +5670,12 @@ ssh_password_disable() {
 
 ssh_password_enable() {
     confirm "确认重新开启密码登录?" || { log_warn "已取消"; return 0; }
-    ssh_backup_config
-    ssh_config_set PasswordAuthentication yes
+    ssh_backup_config || return 1
+    ssh_config_set PasswordAuthentication yes || { ssh_restore_config; return 1; }
     if sshd -T 2>/dev/null | grep -q '^kbdinteractiveauthentication'; then
-        ssh_config_set KbdInteractiveAuthentication yes
+        ssh_config_set KbdInteractiveAuthentication yes || { ssh_restore_config; return 1; }
     else
-        ssh_config_set ChallengeResponseAuthentication yes
+        ssh_config_set ChallengeResponseAuthentication yes || { ssh_restore_config; return 1; }
     fi
     ssh_validate_and_restart || return 0
     log_info "密码登录已开启"
@@ -5359,19 +5761,19 @@ ephemeral_install() {
     ephemeral_resolve_zsh_config
 
     _stamp=$(date -u +%Y%m%dT%H%M%SZ)
-    _backup_dir="/root/ephemeral-logs-backup-$_stamp"
-    mkdir -p "$_backup_dir"
-    chmod 700 "$_backup_dir"
-    ephemeral_backup_file "$JOURNAL_DROPIN" "$_backup_dir"
-    ephemeral_backup_file "$EPHEMERAL_BASH_CONFIG" "$_backup_dir"
-    ephemeral_backup_file "$EPHEMERAL_ZSH_CONFIG" "$_backup_dir"
-    ephemeral_backup_file "$FSTAB_FILE" "$_backup_dir"
+    _backup_dir="$EPHEMERAL_BACKUP_PREFIX-$_stamp"
+    mkdir -p "$_backup_dir" && chmod 700 "$_backup_dir" &&
+        ephemeral_backup_file "$JOURNAL_DROPIN" "$_backup_dir" &&
+        ephemeral_backup_file "$EPHEMERAL_BASH_CONFIG" "$_backup_dir" &&
+        ephemeral_backup_file "$EPHEMERAL_ZSH_CONFIG" "$_backup_dir" &&
+        ephemeral_backup_file "$FSTAB_FILE" "$_backup_dir" ||
+        { log_error "无法备份日志配置"; return 1; }
 
-    mkdir -p /etc/profile.d
+    mkdir -p /etc/profile.d || return 1
 
     if ephemeral_has_systemd; then
-        mkdir -p "$JOURNAL_DROPIN_DIR"
-        cat > "$JOURNAL_DROPIN" <<'EOF'
+        mkdir -p "$JOURNAL_DROPIN_DIR" || return 1
+        cat > "$JOURNAL_DROPIN" <<'EOF' || return 1
 [Journal]
 Storage=volatile
 RuntimeMaxUse=32M
@@ -5383,7 +5785,7 @@ ForwardToWall=no
 EOF
     fi
 
-    cat > "$EPHEMERAL_BASH_CONFIG" <<'EOF'
+    cat > "$EPHEMERAL_BASH_CONFIG" <<'EOF' || return 1
 # Disable persistent Bash command history for interactive shells.
 export HISTFILE=/dev/null
 export HISTSIZE=0
@@ -5392,10 +5794,10 @@ EOF
 
     if ! ephemeral_write_zsh_config; then
         log_error "无法更新 Zsh 全局配置: $EPHEMERAL_ZSH_CONFIG"
-        return 0
+        return 1
     fi
-    chmod 644 "$EPHEMERAL_BASH_CONFIG" "$EPHEMERAL_ZSH_CONFIG"
-    [ ! -f "$JOURNAL_DROPIN" ] || chmod 644 "$JOURNAL_DROPIN"
+    chmod 644 "$EPHEMERAL_BASH_CONFIG" "$EPHEMERAL_ZSH_CONFIG" || return 1
+    [ ! -f "$JOURNAL_DROPIN" ] || chmod 644 "$JOURNAL_DROPIN" || return 1
 
     if ! grep -Fq "$FSTAB_EPHEMERAL_MARKER" "$FSTAB_FILE" \
         && ! grep -Fq "$FSTAB_EPHEMERAL_OLD_MARKER" "$FSTAB_FILE" \
@@ -5407,13 +5809,13 @@ EOF
         printf '\n%s\n%s\n' \
             "$FSTAB_EPHEMERAL_MARKER" \
             "tmpfs /var/log tmpfs $_fstab_opts 0 0" \
-            >> "$FSTAB_FILE"
+            >> "$FSTAB_FILE" || return 1
     fi
 
     if ephemeral_has_systemd; then
         if ! systemctl restart systemd-journald; then
             log_error "systemd-journald 重启失败，请检查配置"
-            return 0
+            return 1
         fi
     else
         log_warn "当前系统不使用 systemd：已跳过 journald 配置，/var/log 将在重启后以 tmpfs 运行"
@@ -5422,6 +5824,43 @@ EOF
     log_warn "请重启服务器，让 /var/log 的 tmpfs 完整生效: reboot"
     ephemeral_warn_application_logs
 }
+
+ephemeral_remove() (
+    confirm "确认移除内存日志配置及其备份，并恢复系统日志设置?" || { log_warn "已取消"; return 0; }
+    new_config=$(mktemp) || return 1
+    trap 'rm -f "$new_config"' EXIT
+    ephemeral_resolve_zsh_config
+
+    if [ -f "$EPHEMERAL_ZSH_CONFIG" ]; then
+        awk -v begin="$EPHEMERAL_ZSH_MARK_BEGIN" -v end="$EPHEMERAL_ZSH_MARK_END" '
+            $0 == begin { skip = 1; next }
+            $0 == end { skip = 0; next }
+            !skip
+            END { if (skip) exit 1 }
+        ' "$EPHEMERAL_ZSH_CONFIG" > "$new_config" &&
+            cat "$new_config" > "$EPHEMERAL_ZSH_CONFIG" || return 1
+    fi
+    if [ -f "$FSTAB_FILE" ]; then
+        awk -v marker="$FSTAB_EPHEMERAL_MARKER" -v legacy="$FSTAB_EPHEMERAL_OLD_MARKER" '
+            $0 == marker || $0 == legacy { managed = 1; next }
+            {
+                remove = managed && $1 == "tmpfs" && $2 == "/var/log" && $3 == "tmpfs"
+                managed = 0
+                if (!remove) print
+            }
+        ' "$FSTAB_FILE" > "$new_config" && cat "$new_config" > "$FSTAB_FILE" || return 1
+    fi
+    rm -f -- "$JOURNAL_DROPIN" "$EPHEMERAL_BASH_CONFIG" || return 1
+    if ephemeral_has_systemd; then
+        systemctl restart systemd-journald || { log_error "systemd-journald 重启失败"; return 1; }
+    fi
+    remove_module_paths "$EPHEMERAL_BACKUP_PREFIX"-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z ||
+        return 1
+    log_info "内存日志配置已移除，Shell 历史设置从新会话恢复"
+    if ephemeral_var_log_is_tmpfs; then
+        log_warn "当前 /var/log 仍挂载为 tmpfs，启动时将按剩余配置重新挂载"
+    fi
+)
 
 ephemeral_purge_existing() {
     printf "${RED}此操作将永久删除已有持久 journal（如有），以及 /root 和 /home 下常见的 Bash/Zsh 历史。${NC}\n"
@@ -5580,6 +6019,9 @@ menu_ntp_servers() { run_menu "NTP › 服务器列表" ntp_servers_view ntp_ser
 ntp_items() {
     if ! command -v chronyd >/dev/null 2>&1; then
         printf '%s\n' "1|安装 chrony|ntp_install|act"
+        if ntp_has_residue; then
+            printf '%s\n' "x|卸载 chrony|ntp_uninstall|act"
+        fi
         return 0
     fi
     if svc_active "$CHRONY_SERVICE"; then
@@ -5610,6 +6052,9 @@ menu_fail2ban_jails() { run_menu "Fail2Ban › 监狱列表" fail2ban_jail_view 
 fail2ban_items() {
     if ! command -v fail2ban-server >/dev/null 2>&1; then
         printf '%s\n' "1|安装 Fail2Ban|fail2ban_install|act"
+        if fail2ban_has_residue; then
+            printf '%s\n' "x|卸载 Fail2Ban|fail2ban_uninstall|act"
+        fi
         return 0
     fi
     if svc_active fail2ban; then
@@ -5632,6 +6077,9 @@ menu_fail2ban() { run_menu "Fail2Ban" fail2ban_status fail2ban_items; }
 singbox_items() {
     if ! command -v sing-box >/dev/null 2>&1; then
         printf '%s\n' "1|安装 Sing-Box|singbox_install|act"
+        if singbox_has_residue; then
+            printf '%s\n' "x|清理 Sing-Box 安装和配置|singbox_uninstall|act"
+        fi
         return 0
     fi
     if [ ! -f "$SINGBOX_CONFIG" ]; then
@@ -5657,6 +6105,9 @@ menu_singbox() { run_menu "Sing-Box" singbox_status singbox_items; }
 acme_items() {
     if ! acme_installed; then
         printf '%s\n' "1|安装 acme.sh|acme_install|act"
+        if acme_has_residue; then
+            printf '%s\n' "x|清理 acme.sh 安装|acme_uninstall|act"
+        fi
         return 0
     fi
     printf '%s\n' "1|申请证书|acme_issue_interactive|act"
@@ -5682,6 +6133,9 @@ menu_firewall_ip() { run_menu "防火墙 › 入站 IP" whitelist_view firewall_
 firewall_items() {
     if ! command -v nft >/dev/null 2>&1; then
         printf '%s\n' "1|安装 nftables|nft_install|act"
+        if nft_has_residue; then
+            printf '%s\n' "x|卸载 nftables|nft_uninstall|act"
+        fi
         return 0
     fi
     if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
@@ -5697,8 +6151,14 @@ firewall_items() {
 menu_firewall() { run_menu "防火墙 (nftables)" nft_status firewall_items; }
 
 nft_forward_items() {
+    if nft_forward_has_residue && command -v nft >/dev/null 2>&1; then
+        printf '%s\n' "x|完全移除转发配置|nft_forward_uninstall|act"
+    fi
     if ! command -v nft >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
         printf '%s\n' "1|安装转发所需组件|nft_forward_install|act"
+        if command -v nft >/dev/null 2>&1 && { nft_forward_active || [ -e "$NFT_FORWARD_SYSCTL" ]; }; then
+            printf '%s\n' "5|停用转发|nft_forward_stop|act"
+        fi
         return 0
     fi
     printf '%s\n' "1|添加转发规则|nft_forward_add|act"
@@ -5709,6 +6169,9 @@ nft_forward_items() {
         printf '%s\n' "5|停用转发|nft_forward_stop|act"
     else
         printf '%s\n' "4|启用转发|nft_forward_start|act"
+        if [ -e "$NFT_FORWARD_SYSCTL" ]; then
+            printf '%s\n' "5|清理转发的开机配置|nft_forward_stop|act"
+        fi
     fi
 }
 menu_nft_forward() { run_menu "nftables 转发" nft_forward_status nft_forward_items; }
@@ -5725,12 +6188,16 @@ menu_realm_endpoints() { run_menu "Realm › 转发规则" realm_endpoints_view 
 
 # 状态自适应: 未安装→安装; 运行中→规则/重启/停止; 已停止→启动
 realm_items() {
-    if ! command -v realm >/dev/null 2>&1; then
+    realm_detect
+    if [ -z "$REALM_BIN" ]; then
         printf '%s\n' "1|安装 realm|realm_install|act"
+        if realm_has_residue; then
+            printf '%s\n' "x|卸载 realm|realm_uninstall|act"
+        fi
         return 0
     fi
     printf '%s\n' "1|配置转发规则 ›|menu_realm_endpoints|sub"
-    if svc_active realm; then
+    if [ -n "$REALM_SERVICE" ] && svc_active "$REALM_SERVICE"; then
         printf '%s\n' "2|重启 realm|realm_restart|act"
         printf '%s\n' "3|停止 realm|realm_disable|act"
         printf '%s\n' "4|查看完整配置|realm_view_config|act"
@@ -5749,6 +6216,9 @@ menu_realm() { run_menu "Realm 转发" realm_status realm_items; }
 ddns_items() {
     if [ ! -f "$DDNS_SCRIPT" ]; then
         printf '%s\n' "1|安装并配置 DDNS|ddns_install|act"
+        if ddns_has_installation; then
+            printf '%s\n' "x|清理 DDNS 安装|ddns_uninstall|act"
+        fi
         return 0
     fi
     printf '%s\n' "1|立即手动更新一次|ddns_run_now|act"
@@ -5768,13 +6238,10 @@ menu_ddns() { run_menu "Cloudflare DDNS" ddns_status ddns_items; }
 # ================================================================
 # 状态自适应: 未启用→应用; 已启用→重新调参/移除
 tcp_items() {
-    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = "bbr" ]; then
-        printf '%s\n' "1|重新应用 BBR 优化 (调整带宽/延迟参数)|bbr_apply|act"
-        printf '%s\n' "2|查看当前 TCP 参数|tcp_view_params|act"
+    printf '%s\n' "1|应用 BBR 优化 (按带宽+延迟自动计算缓冲)|bbr_apply|act"
+    printf '%s\n' "2|查看当前 TCP 参数|tcp_view_params|act"
+    if bbr_has_config; then
         printf '%s\n' "3|移除 BBR 优化|bbr_remove|act"
-    else
-        printf '%s\n' "1|应用 BBR 优化 (按带宽+延迟自动计算缓冲)|bbr_apply|act"
-        printf '%s\n' "2|查看当前 TCP 参数|tcp_view_params|act"
     fi
 }
 menu_tcp_tune() { run_menu "TCP 调优 (BBR)" tcp_status tcp_items; }
@@ -5814,6 +6281,7 @@ ephemeral_items() {
     printf '%s\n' "1|安装/重新应用内存日志配置|ephemeral_install|act"
     printf '%s\n' "2|查看详细状态|ephemeral_status|act"
     printf '%s\n' "3|${RED}清理已有日志和 Shell 历史 ⚠${NC}|ephemeral_purge_existing|act"
+    printf '%s\n' "x|移除内存日志配置|ephemeral_remove|act"
 }
 menu_ephemeral() { run_menu "内存日志" ephemeral_status ephemeral_items; }
 

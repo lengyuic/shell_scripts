@@ -78,6 +78,7 @@ q) 退出脚本
 状态栏显示：安装 / 启用 / 当前时区 / 当前时间 / NTP 同步状态 + 偏差。
 
 - 安装 / 卸载 / 启用 / 禁用 / 强制同步一次（`chronyc makestep`）
+- 卸载会清理 chrony 的服务、配置、自定义 NTP 列表、运行状态和独立日志。
 - 详细状态（`chronyc tracking` + `chronyc sources -v`）
 - **自定义 NTP 服务器（增删改查）** — 持久化到 `/etc/ntp_servers.conf`，通过 sentinel 块（`# === BEGIN setup.sh CUSTOM SOURCES ===`）写入 `chrony.conf`，不污染原文件
 - 自动识别 chrony 的服务名（Debian 系 `chrony` / RHEL 系 `chronyd`）与配置路径（`/etc/chrony/chrony.conf` 或 `/etc/chrony.conf`）
@@ -86,6 +87,7 @@ q) 退出脚本
 状态栏显示：安装 / 服务 / 启用监狱 / 当前监禁数 / SSH 端口 / 已配置监狱数。
 
 - 安装 / 卸载 / 启用（写 jail.local 并启动）/ 禁用 / 查看监禁状态 / 解封 IP
+- 卸载会清理监狱配置及备份、封禁数据库和独立日志。
 - **监狱 jail（增删改查）** — 持久化到 `/etc/fail2ban_jails.conf`，启用时按列表生成 `jail.local`
 - 内置 jail 模板：`sshd`、`sshd-ddos`、`recidive`，也支持自定义 filter 名（如 `nginx-http-auth`）
 - 端口支持 `auto`（自动取当前 sshd 端口）、`all`（recidive 用）、或具体端口号
@@ -94,6 +96,8 @@ q) 退出脚本
 状态栏显示：安装 / 服务 / 当前协议。**完全以 `/etc/sing-box/config.json` 为唯一数据源，不依赖任何缓存文件**。
 
 - 安装 / 卸载 / 配置代理 / **查看代理链接** / 删除代理 / 重启代理
+- 卸载按实际安装的软件包处理，包括 stable、beta、testing 和 oldstable。会先停止服务和 systemd 实例，软件包移除成功后再清理服务覆盖配置、独立二进制、代理配置与备份、状态目录和独立日志。
+
 - 支持两种协议：
   - **Shadowsocks-2022**（落地机推荐）
   - **VLESS + Reality**（中转机推荐，自动测延迟选最佳 SNI 域名）
@@ -106,6 +110,7 @@ q) 退出脚本
 状态栏显示：安装 / 服务 / 当前 table 总数 / 本脚本 table 是否存在 / 白名单 IP 数。**完全以 live nftables 状态为唯一数据源**，不会影响你手动添加的其他 table（如 `filter`、`nat`）。
 
 - 安装 / 卸载 / 启用（创建 `inet landing_whitelist` 表）/ 禁用（删表）/ 清空全部 nft 规则
+- 卸载会清除白名单和转发规则、移除软件包及其本地配置。存在其他活动规则表时，会列出这些表并阻止卸载，以免影响共享防火墙。
 - **入站 IP（增删改查）** — 直接 `nft add/delete element inet landing_whitelist admin_ip4`
 - 每次 CRUD 自动 `nft list ruleset > /etc/nftables.conf` 持久化（**包含你的其他 table**，重启后整体恢复）
 - 白名单为空 + 防火墙开启 → 警告会锁死自己
@@ -114,7 +119,7 @@ q) 退出脚本
 状态栏显示：拥塞控制 / 队列算法 / 缓冲上限 / 优化配置状态 / 开机持久化状态。
 
 - **应用 BBR 优化**：交互选择带宽（100 Mbps – 2.5 Gbps，含自定义）+ 延迟（30 ms – 250 ms，含自定义），按 BDP × 2.5 自动算缓冲（4 MB 下限、128 MB 上限）
-- **移除 BBR 优化**：清掉 sysctl conf + 卸载持久化 service
+- **移除 BBR 优化**：清理脚本写入的 sysctl、文件描述符限制和开机服务配置。运行中的内核参数与队列设置在重启后按剩余配置重新加载。
 - **查看完整 TCP 参数**：dump 关键 sysctl + 每张网卡当前 qdisc
 - 配置写到 `/etc/sysctl.d/99-bbr-direct-manual.conf`
 - 安装 `bbr-optimize-persist` 开机服务（按 init 生成 systemd unit / OpenRC 脚本 / rc.local 块 / SysV 脚本）自动恢复 `tc fq` / MSS clamp / initcwnd 32 / RPS
@@ -123,12 +128,14 @@ q) 退出脚本
 状态栏显示：安装 / 二进制路径 / 配置文件路径 / 服务状态 / 转发规则数。**自动检测 `/opt/realm` 与 `/etc/realm` 两个常见路径**。
 
 - 安装（github releases，自动识别 `x86_64` / `aarch64` / `armv7` 架构）/ 卸载 / 启用 / 禁用 / **重启**
+- 卸载会清理服务、二进制、`/opt/realm` 和 `/etc/realm` 内的配置与备份，以及独立的状态、日志目录。
 - 查看完整配置
 - **转发规则（增删改查）** — 直接编辑 TOML 配置，每次操作自动 `.bak.<timestamp>` 备份，修改后若服务在运行则自动 `systemctl restart`
 
 ### f) nftables 转发（TCP/UDP）
 
 - 支持规则增删改查、启用、重新加载和停用。启用后修改会立即应用，停用后可重新启用已保存的规则。
+- 按 `x` 完全移除转发的规则表、白名单中的转发链、保存的规则及开机配置。白名单防火墙和 nftables 软件包继续可用。
 - 输入监听和目标地址，例如 `0.0.0.0:5000 → 192.0.2.10:6000` 或 `[::]:5000 → [2001:db8::10]:6000`。两端须为同一地址族的 IP，可选 TCP、UDP 或同时转发。
 - 入站流量经 DNAT 后按 Linux 路由表转发，回程使用 masquerade，目标端看到中转机的出站地址。该功能处理从网络进入中转机的流量。
 - 脚本会放行其白名单防火墙中与转发规则匹配的连接。若系统还运行其他防火墙，相关的 FORWARD 链也需允许该流量。
@@ -141,6 +148,7 @@ q) 退出脚本
 - 记录模式支持 **仅 IPv4** 或 **IPv4 + IPv6 双栈**，可选 Cloudflare 代理（橙云）与自定义 TTL
 - 生成独立的 `/root/ddns.sh` 并写入 crontab（**每 5 分钟自动更新**，IP 未变化则跳过），日志自动截尾保留 500 行
 - 立即手动更新一次 / 查看日志（错误红色、成功绿色高亮）/ 暂停・恢复自动更新 / 卸载
+- 卸载移除本脚本的 cron 任务、脚本、Token、配置及本地更新日志。Cloudflare 上的 DNS 记录可能由其他服务使用，因此卸载只处理本机。
 - cron 包名按发行版自动适配（Debian 系 `cron` / RHEL・Arch 系 `cronie` / Alpine `dcron`）
 
 ### 9) SSH 配置
@@ -151,6 +159,14 @@ q) 退出脚本
 - **密码登录开关**：按当前状态显示"关闭/开启密码登录"；关闭前强制要求 authorized_keys 至少有一把密钥，需输入 `yes` 确认；自动兼容新旧 OpenSSH（`KbdInteractiveAuthentication` / `ChallengeResponseAuthentication`）
 - 配置写入自动适配：存在 `Include sshd_config.d` 时写入 `00-setup-script.conf` drop-in（优先级最高），否则直接改 `sshd_config`；每次修改前自动备份，校验失败回滚
 - 安全兜底：密码登录已关闭时禁止删除最后一把密钥
+
+### c) ACME 证书
+
+- 卸载会删除续期任务、acme.sh 本地账户数据及脚本管理的证书和私钥。引用这些文件的服务需先切换证书。
+
+### e) 内存日志
+
+- 在内存日志菜单按 `x` 移除脚本写入的配置和安装时生成的备份，恢复日志和 Shell 历史设置。新会话读取更新后的 Shell 配置，`/var/log` 在下次启动时按剩余挂载配置加载。
 
 ### 10) 系统重装（DD）
 集成 [bin456789/reinstall](https://github.com/bin456789/reinstall)，覆盖以下系统：
@@ -177,10 +193,10 @@ q) 退出脚本
 ```
 选系统 → 选版本(若有) → [ubuntu 额外问 --minimal] → SSH 端口(默认沿用当前)
        → SSH 公钥(留空回退到 /root/.ssh/authorized_keys 第一行)
-       → 摘要展示 → y/n 确认 → 下载 reinstall.sh → 执行
+       → 摘要展示 → 输入 yes 确认 → 下载并执行 reinstall.sh → 准备成功后自动重启
 ```
 
-公钥缺失会**拒绝执行**（避免重装后无法登录）。reinstall.sh 完成后不会自动重启，需手动 `reboot` 进入新系统。
+公钥缺失会**拒绝执行**（避免重装后无法登录）。`reinstall.sh` 成功退出后，脚本会自动执行 `reboot` 并进入重装流程。若自动重启失败，脚本会提示手动执行 `reboot`。
 
 ## 文件清单
 
