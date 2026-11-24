@@ -12,6 +12,7 @@
 #   1 安装常用软件      2 NTP 时间同步     3 Fail2Ban
 #   4 Sing-Box (SS2022/VLESS-Reality/AnyTLS+ACME)  5 防火墙(nftables)  6 TCP 调优(BBR)
 #   7 Realm 转发        8 Cloudflare DDNS  9 SSH 配置
+#   f nftables 转发
 #   c ACME 证书 (Let's Encrypt, 独立模块, 任何服务都可引用)
 #   e 内存日志 (系统日志、/var/log tmpfs、禁用 Shell 持久历史)
 #   d 系统重装 (DD)
@@ -41,6 +42,8 @@ ACME_CERT_DIR="/etc/ssl/acme"
 NFT_CONF="/etc/nftables.conf"
 NFT_TABLE="landing_whitelist"
 NFT_WL_FILE="/etc/landing_whitelist.conf"
+NFT_FORWARD_RULES="/etc/setup-nft-forward.rules"
+NFT_FORWARD_SYSCTL="/etc/sysctl.d/90-setup-nft-forward.conf"
 NTP_SERVERS_FILE="/etc/ntp_servers.conf"
 CHRONY_CONF="/etc/chrony/chrony.conf"
 CHRONY_MARK_BEGIN="# === BEGIN setup.sh CUSTOM SOURCES ==="
@@ -2843,8 +2846,13 @@ table inet $NFT_TABLE {
 }
 EOF
     _ret=$?
-    [ "$_ret" -eq 0 ] && nft_restore_whitelist_file
-    return "$_ret"
+    [ "$_ret" -eq 0 ] || return "$_ret"
+    nft_restore_whitelist_file
+    if nft_forward_active && [ -s "$NFT_FORWARD_RULES" ]; then
+        nft_forward_apply "$NFT_FORWARD_RULES" enabled
+    else
+        return 0
+    fi
 }
 
 # 解析 nftables 服务开机加载的配置文件路径 (各发行版不同)
@@ -2868,19 +2876,259 @@ resolve_nft_conf() {
 }
 
 # 把 live ruleset 持久化到 $NFT_CONF (包括用户其他 table), 同时备份白名单
-nft_persist() {
+nft_persist() (
     resolve_nft_conf
-    mkdir -p "$(dirname "$NFT_CONF")"
-    {
-        echo "#!/usr/sbin/nft -f"
-        echo ""
-        echo "flush ruleset"
-        echo ""
-        nft list ruleset 2>/dev/null
-    } > "$NFT_CONF"
+    mkdir -p "$(dirname "$NFT_CONF")" || return 1
+    nft_save_tmp=$(mktemp "${NFT_CONF}.XXXXXX") || return 1
+    trap 'rm -f "$nft_save_tmp"' EXIT
+    if ! { printf '#!/usr/sbin/nft -f\n\nflush ruleset\n\n' &&
+        nft list ruleset; } > "$nft_save_tmp" ||
+        ! mv -f "$nft_save_tmp" "$NFT_CONF"; then
+        log_error "无法保存 nftables 规则到 $NFT_CONF"
+        return 1
+    fi
     nft_save_whitelist_file
     log_info "ruleset 已持久化到 $NFT_CONF"
+)
+
+# ================================================================
+# nftables 转发：DNAT 后由内核路由，回程使用 masquerade。
+# ================================================================
+nft_forward_active() {
+    nft list table inet setup_port_forward >/dev/null 2>&1
 }
+
+nft_forward_list() {
+    if [ -s "$NFT_FORWARD_RULES" ]; then
+        awk '{printf "  %d) %-7s %s → %s\n", NR, $1, $2, $3}' "$NFT_FORWARD_RULES"
+    else
+        printf '  暂无转发规则\n'
+    fi
+}
+
+nft_forward_status() {
+    if nft_forward_active; then
+        printf "  内核转发规则: ${GREEN}已启用${NC}\n"
+    else
+        printf "  内核转发规则: ${YELLOW}未启用${NC}\n"
+    fi
+    nft_forward_list
+}
+
+nft_forward_install() {
+    command -v nft >/dev/null 2>&1 || nft_install || return 1
+    command -v python3 >/dev/null 2>&1 || pkg_install python3 || return 1
+    command -v nft >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1
+}
+
+# 使用 ipaddress 验证并规范化地址，避免等价 IPv6 写法产生重复规则。
+nft_forward_endpoint() {
+    python3 - "$1" "$2" "$3" <<'PYTHON'
+import ipaddress
+import re
+import sys
+
+protocol, listen, remote = sys.argv[1:]
+if protocol not in {"tcp", "udp", "tcp+udp"}:
+    sys.exit("协议必须为 tcp、udp 或 tcp+udp")
+
+def endpoint(value):
+    match = re.fullmatch(r"(?:\[([0-9A-Fa-f:.]+)\]|([0-9.]+)):([0-9]{1,5})", value)
+    if not match:
+        raise ValueError("请使用 IPv4:端口 或 [IPv6]:端口")
+    ipv6, ipv4, port = match.groups()
+    address = ipaddress.ip_address(ipv6 or ipv4)
+    if address.version != (6 if ipv6 else 4) or not 1 <= int(port) <= 65535:
+        raise ValueError("地址格式或端口无效")
+    host = f"[{address}]" if ipv6 else str(address)
+    return address, f"{host}:{int(port)}"
+
+try:
+    source, listen = endpoint(listen)
+    target, remote = endpoint(remote)
+    if source.version != target.version:
+        raise ValueError("监听与目标地址必须使用相同的 IP 协议版本")
+    if target.is_unspecified or target.is_multicast or target.is_loopback or target.is_link_local:
+        raise ValueError("目标必须是可路由的单播地址")
+    if listen == remote:
+        raise ValueError("监听与目标地址不能相同")
+except ValueError as error:
+    sys.exit(str(error))
+
+print(protocol, listen, remote)
+PYTHON
+}
+
+# 所有 live 变更放在同一个 nft 事务中。白名单链仅放行这组 DNAT 的连接。
+nft_forward_batch() {
+    if nft_forward_active; then
+        printf 'delete table inet setup_port_forward\n'
+    fi
+    if nft list chain inet "$NFT_TABLE" setup_port_forward >/dev/null 2>&1; then
+        printf 'flush chain inet %s setup_port_forward\n' "$NFT_TABLE"
+        forward_whitelist=yes
+    elif nft list chain inet "$NFT_TABLE" forward >/dev/null 2>&1; then
+        forward_whitelist=yes
+        if [ "$2" = enabled ]; then
+            printf 'add chain inet %s setup_port_forward\n' "$NFT_TABLE"
+            printf 'insert rule inet %s forward jump setup_port_forward\n' "$NFT_TABLE"
+        fi
+    else
+        forward_whitelist=no
+    fi
+    [ "$2" = enabled ] || return 0
+
+    cat <<'RULES'
+add table inet setup_port_forward
+add chain inet setup_port_forward prerouting { type nat hook prerouting priority dstnat; policy accept; }
+add chain inet setup_port_forward postrouting { type nat hook postrouting priority srcnat; policy accept; }
+RULES
+    awk -v whitelist="$forward_whitelist" -v table="$NFT_TABLE" '
+        {
+            family = ($2 ~ /^\[/ ? "ip6" : "ip")
+            listen = $2; sub(/:[0-9]+$/, "", listen); gsub(/\[|\]/, "", listen)
+            target = $3; sub(/:[0-9]+$/, "", target); gsub(/\[|\]/, "", target)
+            port = $2; sub(/^.*:/, "", port)
+            target_port = $3; sub(/^.*:/, "", target_port)
+            wildcard = (listen == "0.0.0.0" || listen == "::")
+            destination = wildcard ? "" : family " daddr " listen " "
+            original = wildcard ? "" : "ct original " family " daddr " listen " "
+            count = split($1, protocols, "+")
+            for (i = 1; i <= count; i++) {
+                proto = protocols[i]
+                printf "add rule inet setup_port_forward prerouting meta nfproto %s fib daddr type local %s%s dport %s counter dnat %s to %s\n",
+                    (family == "ip" ? "ipv4" : "ipv6"), destination, proto, port, family, $3
+                tuple = "ct status dnat ct original protocol " proto " " original "ct original proto-dst " port " ct reply " family " saddr " target " ct reply proto-src " target_port
+                print "add rule inet setup_port_forward postrouting " tuple " masquerade"
+                if (whitelist == "yes")
+                    print "add rule inet " table " setup_port_forward " tuple " counter accept"
+            }
+        }
+    ' "$1"
+}
+
+nft_forward_apply() (
+    forward_rules=$1
+    forward_mode=$2
+    forward_tmp=$(mktemp) || return 1
+    trap 'rm -f "$forward_tmp"' EXIT
+    nft_forward_batch "$forward_rules" "$forward_mode" > "$forward_tmp" || return 1
+    nft -f "$forward_tmp"
+)
+
+nft_forward_commit() (
+    forward_candidate=$1
+    forward_mode=$2
+    forward_before=disabled
+    nft_forward_active && forward_before=enabled
+
+    if [ "$forward_mode" = enabled ]; then
+        [ -s "$forward_candidate" ] || { log_error "请先添加转发规则"; return 1; }
+        svc_enable nftables || { log_error "无法设置 nftables 开机加载"; return 1; }
+        mkdir -p /etc/sysctl.d || return 1
+        forward_sysctl=$(mktemp "${NFT_FORWARD_SYSCTL}.XXXXXX") || return 1
+        trap 'rm -f "$forward_sysctl"' EXIT
+        awk '
+            $2 ~ /^\[/ { ipv6 = 1; next }
+            { ipv4 = 1 }
+            END {
+                if (ipv4) print "net.ipv4.ip_forward = 1"
+                if (ipv6) print "net.ipv6.conf.all.forwarding = 1"
+            }
+        ' "$forward_candidate" > "$forward_sysctl" &&
+            sysctl -p "$forward_sysctl" >/dev/null || return 1
+    fi
+
+    nft_forward_apply "$forward_candidate" "$forward_mode" || return 1
+    if ! nft_persist; then
+        if ! nft_forward_apply "$NFT_FORWARD_RULES" "$forward_before"; then
+            log_error "恢复原转发规则失败，请检查 live nftables 规则"
+        fi
+        return 1
+    fi
+    if [ "$forward_mode" = enabled ]; then
+        mv -f "$forward_sysctl" "$NFT_FORWARD_SYSCTL" || return 1
+    else
+        rm -f "$NFT_FORWARD_SYSCTL" || return 1
+    fi
+)
+
+nft_forward_start() {
+    nft_forward_commit "$NFT_FORWARD_RULES" enabled && log_info "转发规则已加载并持久化"
+}
+
+nft_forward_stop() {
+    nft_forward_commit "$NFT_FORWARD_RULES" disabled && log_info "已停用转发，规则配置已保留"
+}
+
+nft_forward_edit() (
+    forward_action=$1
+    forward_row=0
+    forward_proto=tcp+udp
+    forward_listen=
+    forward_target=
+    if [ "$forward_action" != add ]; then
+        [ -s "$NFT_FORWARD_RULES" ] || { log_warn "暂无转发规则"; return 1; }
+        nft_forward_list
+        read_input "输入规则编号（回车取消）" "" forward_row
+        case "$forward_row" in ''|*[!0-9]*) return 1 ;; esac
+        forward_old=$(awk -v row="$forward_row" 'NR == row {print; exit}' "$NFT_FORWARD_RULES")
+        [ -n "$forward_old" ] || { log_error "规则编号无效"; return 1; }
+        read -r forward_proto forward_listen forward_target <<EOF_RULE
+$forward_old
+EOF_RULE
+    fi
+
+    forward_entry=
+    if [ "$forward_action" != delete ]; then
+        read_input "协议（tcp / udp / tcp+udp）" "$forward_proto" forward_proto
+        read_input "监听地址（如 0.0.0.0:5000 或 [::]:5000）" "$forward_listen" forward_listen
+        [ -n "$forward_listen" ] || return 1
+        read_input "目标地址（如 192.0.2.10:5000 或 [2001:db8::10]:5000）" "$forward_target" forward_target
+        forward_entry=$(nft_forward_endpoint "$forward_proto" "$forward_listen" "$forward_target") || return 1
+    fi
+
+    forward_tmp=$(mktemp "${NFT_FORWARD_RULES}.XXXXXX") || return 1
+    trap 'rm -f "$forward_tmp"' EXIT
+    forward_source=/dev/null
+    [ ! -f "$NFT_FORWARD_RULES" ] || forward_source=$NFT_FORWARD_RULES
+    awk -v row="$forward_row" -v entry="$forward_entry" '
+        NR != row { print }
+        NR == row && entry != "" { print entry }
+        END { if (!row && entry != "") print entry }
+    ' "$forward_source" > "$forward_tmp" || return 1
+    if ! awk '
+        {
+            count = split($1, protocols, "+")
+            for (i = 1; i <= count; i++) {
+                family = ($2 ~ /^\[/ ? 6 : 4)
+                port = $2; sub(/^.*:/, "", port)
+                group = family SUBSEP port SUBSEP protocols[i]
+                key = group SUBSEP $2
+                if (seen[key]++ || wildcard[group]) exit 1
+                if ($2 ~ /^(0\.0\.0\.0|\[::\]):/) {
+                    if (used[group]) exit 1
+                    wildcard[group] = 1
+                }
+                used[group] = 1
+            }
+        }
+    ' "$forward_tmp"; then
+        log_error "监听地址、端口和协议与现有规则冲突"
+        return 1
+    fi
+
+    if nft_forward_active; then
+        forward_mode=enabled
+        [ -s "$forward_tmp" ] || forward_mode=disabled
+        nft_forward_commit "$forward_tmp" "$forward_mode" || return 1
+    fi
+    mv -f "$forward_tmp" "$NFT_FORWARD_RULES" && log_info "转发配置已保存"
+)
+
+nft_forward_add() { nft_forward_edit add; }
+nft_forward_modify() { nft_forward_edit modify; }
+nft_forward_delete() { nft_forward_edit delete; }
 
 nft_status() {
     printf "${MAGENTA}--- 防火墙 (nft) 状态 ---${NC}\n"
@@ -5448,6 +5696,23 @@ firewall_items() {
 }
 menu_firewall() { run_menu "防火墙 (nftables)" nft_status firewall_items; }
 
+nft_forward_items() {
+    if ! command -v nft >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        printf '%s\n' "1|安装转发所需组件|nft_forward_install|act"
+        return 0
+    fi
+    printf '%s\n' "1|添加转发规则|nft_forward_add|act"
+    printf '%s\n' "2|删除转发规则|nft_forward_delete|act"
+    printf '%s\n' "3|修改转发规则|nft_forward_modify|act"
+    if nft_forward_active; then
+        printf '%s\n' "4|重新加载转发|nft_forward_start|act"
+        printf '%s\n' "5|停用转发|nft_forward_stop|act"
+    else
+        printf '%s\n' "4|启用转发|nft_forward_start|act"
+    fi
+}
+menu_nft_forward() { run_menu "nftables 转发" nft_forward_status nft_forward_items; }
+
 # ================================================================
 # 子菜单: Realm
 # ================================================================
@@ -5563,6 +5828,7 @@ main_items() {
     printf '%s\n' "5|防火墙 (nftables)       $(brief_firewall)|menu_firewall|sub"
     printf '%s\n' "6|TCP 调优 (BBR)          $(brief_tcp)|menu_tcp_tune|sub"
     printf '%s\n' "7|Realm 转发              $(brief_svc realm realm)|menu_realm|sub"
+    printf '%s\n' "f|nftables 转发|menu_nft_forward|sub"
     printf '%s\n' "8|Cloudflare DDNS         $(brief_ddns)|menu_ddns|sub"
     printf '%s\n' "9|SSH 配置                $(brief_ssh)|menu_ssh|sub"
     printf '%s\n' "c|ACME 证书               $(brief_acme)|menu_acme|sub"

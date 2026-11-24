@@ -50,6 +50,7 @@ sudo sh setup.sh
 5) 防火墙配置 >
 6) TCP 调优 >
 7) Realm 配置 >
+f) nftables 转发 >
 8) Cloudflare DDNS >
 9) SSH 配置 >
 10) 系统重装 (DD) ⚠
@@ -124,6 +125,14 @@ q) 退出脚本
 - 安装（github releases，自动识别 `x86_64` / `aarch64` / `armv7` 架构）/ 卸载 / 启用 / 禁用 / **重启**
 - 查看完整配置
 - **转发规则（增删改查）** — 直接编辑 TOML 配置，每次操作自动 `.bak.<timestamp>` 备份，修改后若服务在运行则自动 `systemctl restart`
+
+### f) nftables 转发（TCP/UDP）
+
+- 支持规则增删改查、启用、重新加载和停用。启用后修改会立即应用，停用后可重新启用已保存的规则。
+- 输入监听和目标地址，例如 `0.0.0.0:5000 → 192.0.2.10:6000` 或 `[::]:5000 → [2001:db8::10]:6000`。两端须为同一地址族的 IP，可选 TCP、UDP 或同时转发。
+- 入站流量经 DNAT 后按 Linux 路由表转发，回程使用 masquerade，目标端看到中转机的出站地址。该功能处理从网络进入中转机的流量。
+- 脚本会放行其白名单防火墙中与转发规则匹配的连接。若系统还运行其他防火墙，相关的 FORWARD 链也需允许该流量。
+- 转发规则保存在 `/etc/setup-nft-forward.rules`。启用时写入 `/etc/sysctl.d/90-setup-nft-forward.conf`，并沿用防火墙模块的 nftables 配置快照在开机时恢复。停用会移除该 sysctl 文件，当前内核的全局 IP 转发状态保留，以免中断其他路由业务。
 
 ### 8) Cloudflare DDNS
 状态栏显示：安装状态 / 域名 / Zone / 记录模式 / CF 代理 / TTL / 自动更新状态 / 最近日志。
